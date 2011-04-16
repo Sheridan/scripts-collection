@@ -1,0 +1,10 @@
+#!/bin/bash
+
+cd linux
+if [ ! -e ./oc ]
+then
+    make oldconfig
+    touch ./oc
+fi
+make -j3 menuconfig
+cd ..

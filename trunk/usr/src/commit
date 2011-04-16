@@ -1,0 +1,13 @@
+#!/bin/bash
+
+dirname="`uname`_`hostname`"
+
+if [ ! -e $dirname ]
+then
+    mkdir $dirname
+fi
+cp -f linux/.config $dirname/.config
+
+cd $dirname
+svn commit --message="Kernel config changed. $dirname. `date`"
+cd ..

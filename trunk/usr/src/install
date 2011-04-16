@@ -1,0 +1,5 @@
+#!/bin/bash
+
+cd linux
+make modules_install install
+cd ..

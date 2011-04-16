@@ -1,0 +1,5 @@
+#!/bin/bash
+
+cd linux
+make -j2 bzImage modules
+cd ..
