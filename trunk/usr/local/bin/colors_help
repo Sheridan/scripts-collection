@@ -1,6 +1,6 @@
 #!/bin/bash
 
-. /etc/sheridan_sc/colors
+. /etc/sheridan-sc/colors
 
 echo "\${c_std}"
 echo "${c_h_std}\${c_h_std}${c_std}"

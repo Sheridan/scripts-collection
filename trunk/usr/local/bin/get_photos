@@ -1,9 +1,9 @@
 #!/bin/bash
 
-. /etc/sheridan_sc/global
-. /etc/sheridan_sc/colors
-. /etc/sheridan_sc/mplayer
-. ${prefix}/lib/sheridan_sc/common
+. /etc/sheridan-sc/global
+. /etc/sheridan-sc/colors
+. /etc/sheridan-sc/mplayer
+. ${prefix}/lib/sheridan-sc/common
 
 # Default source directory
 source=/mnt/flash/card_reader_sd_card/dcim/101sscam
