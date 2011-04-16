@@ -1,6 +1,6 @@
 #!/bin/bash
 
-. /etc/colors
+. /etc/sheridan-sc/colors
 
 function help() {
     echo '
