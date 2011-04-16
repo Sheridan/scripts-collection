@@ -1,0 +1,4 @@
+#Global config for linux-community scripts collection
+
+#Install prefix
+prefix=/usr/local

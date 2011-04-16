@@ -1,0 +1,97 @@
+#!/bin/bash
+
+. /etc/sheridan_sc/global
+. /etc/sheridan_sc/colors
+. /etc/sheridan_sc/mplayer
+. ${prefix}/lib/sheridan_sc/common
+
+source=/dev/dvd
+destination_filename=~/tmp/videoshots/result.png
+tmp_dir=/tmp/videoshots
+aspect="16/9"
+# Global mplayer options
+mplayer_global=" ${mplayer_global} -frames 1 -osdlevel 3"
+row_size=3
+
+while [ $# -gt 0 ]
+do
+    case "$1" in
+        -r )
+            shift
+            row_size=$1
+        ;;
+	-s )
+            shift
+            source=$1
+        ;;
+        -d )
+            shift
+            destination_filename=$1
+        ;;
+        -a )
+            shift
+            aspect=$1
+        ;;
+        --help | -h )
+            echo "
+        -h      This help
+        -s      Source video
+        -d      Result picture file path/name (default ${destination_filename})
+	-r	Shots row size (default ${row_size} -> ${row_size}x${row_size} shots)
+        -a      Aspect ratio [16/9|4/3] (default ${aspect})
+"
+            exit 0
+        ;;
+    esac
+    shift
+done
+
+destination=$(dirname "$destination_filename")
+
+current_dir=$CWD
+
+start=`date +%s`
+mk_dir $destination
+mk_dir $tmp_dir
+cd $tmp_dir
+
+video_width=`midentify "${source}" | grep ID_VIDEO_WIDTH | sed -e "s/.*=//"`
+video_heigt=`midentify "${source}" | grep ID_VIDEO_HEIGHT | sed -e "s/.*=//"`
+video_bitrate=`midentify "${source}" | grep ID_VIDEO_BITRATE | sed -e "s/.*=//"`
+video_fps=`midentify "${source}" | grep ID_VIDEO_FPS | sed -e "s/.*=//"`
+video_length=`midentify "${source}" | grep ID_LENGTH | sed -e "s/.*=//" | sed -e "s/\..*//"`
+time_step=$(( video_length/(row_size*row_size)  ))
+echo "[${c_yellow}$(basename $source)${c_std}]"
+echo "[${c_h_pink}Image size     ${c_std}: ${c_h_green}${video_width}x${video_heigt}${c_std}]"
+echo "[${c_h_pink}Bitrate        ${c_std}: ${c_h_green}${video_bitrate}${c_std}]"
+echo "[${c_h_pink}Length         ${c_std}: ${c_h_green}$( secunds_to_time ${video_length} )${c_std}]"
+echo "[${c_h_pink}FPS            ${c_std}: ${c_h_green}${video_fps}${c_std}]"
+echo "[${c_h_pink}Shot every     ${c_std}: ${c_h_green}${time_step}${c_h_pink} sec.${c_std}]"
+
+mplayer_common="${mplayer_verbose} -fps ${video_fps}"
+mplayer_filters="-vf hqdn3d,expand=::::1::,scale=${video_width}:${video_heigt}:0,dsize=${aspect},pp=hb/vb/dr/al/ci"
+
+current_time=0
+frame_files=""
+
+echo "[${c_h_green}Extracting frames${c_std}]"
+for (( x=1; x<=row_size; x++))
+do
+    for (( y=1; y<=row_size; y++))
+    do
+	echo "[${c_h_pink}Current frame: ${c_h_green}${x}:${y}${c_h_pink}, position: ${c_h_green}$( secunds_to_time ${current_time} )${c_std}]"
+	cmd mplayer "${source}" ${mplayer_global} -ss ${current_time} ${mplayer_common} ${mplayer_filters} -vo png:z=1 -ao null -nosound
+	mv -f "${tmp_dir}/00000001.png" "${tmp_dir}/${x}_${y}.png"
+	(( current_time += time_step ))
+	frame_files="${frame_files} ${tmp_dir}/${x}_${y}.png"
+	echo
+    done
+done
+
+echo "[${c_h_green}Montage extracted files${c_std}]"
+montage -background black -geometry +3+3 ${frame_files} ${destination_filename}
+
+cd $current_dir
+rm -rf $tmp_dir
+echo "[${c_h_cayan}Total encoding time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $start)) )${c_std}]"
+

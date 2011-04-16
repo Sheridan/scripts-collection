@@ -1,0 +1,84 @@
+#!/bin/bash
+
+. /etc/sheridan_sc/colors
+
+function check_err () {
+    if (( $1 > 0 ))
+    then
+        echo "[${c_red}o0 Some error...(${1}) ${c_std}]"
+        exit $1
+    fi
+}
+
+function regexp_files_cp() {
+    local start=`date +%s`
+    local regexp=$1
+    local source=$2
+    local destination=$3
+    echo "[${c_h_cayan}Copying files ${c_h_green}${regexp}${c_h_cayan} from ${c_yellow}${source}${c_h_cayan} to ${c_yellow}${destination}${c_std}]"
+    for file in $(find ${source} -type f | egrep "$regexp")
+    do
+        echo -n "${c_blue}$(basename $file)${c_std} "
+        cp -f "${file}" -t "${destination}"
+        check_err $?
+    done
+    echo
+    echo "[${c_h_cayan}Copying done. Elapsed time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $start)) )${c_std}]"
+}
+
+function regexp_files_rm() {
+    local start=`date +%s`
+    local regexp=$1
+    local source=$2
+    echo "[${c_h_cayan}Deleting files ${c_h_green}${regexp}${c_h_cayan} from ${c_yellow}${source}${c_std}]"
+    for file in $(find $source -type f | egrep "$regexp")
+    do
+        echo -n "${c_blue}$(basename $file)${c_std} "
+        rm -f "${file}"
+        check_err $?
+    done
+    echo
+    echo "[${c_h_cayan}Deleting done. Elapsed time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $start)) )${c_std}]"
+}
+
+function cmd () {
+    echo -n "${c_blue}"
+    #echo $@
+    $@
+    local cmd_result="$?"
+    echo -n "${c_std}"
+    return $cmd_result
+}
+
+function mk_dir () {
+    if [ ! -e $1 ]
+    then
+        cmd mkdir -p $1
+        check_err $?
+    fi
+}
+
+function cp_uniq() {
+    target_dir=$1
+    target_filename=$2
+    target_fileext=$3
+    source_file=$4
+    target_file="${target_dir}/${target_filename}.${target_fileext}"
+    count_files=`ls -1 ${target_dir} | egrep -c ".*${target_filename}_\[[0-9]*\]\.${target_fileext}"`
+    if (($count_files > 0))
+    then
+	target_file="${target_dir}/$(printf "%s_[%03d].%s" "${target_filename}" ${count_files} "${target_fileext}")"
+    else
+	if [ -e "${target_dir}/${target_filename}.${target_fileext}" ]
+        then
+    	    cmd mv -v "${target_dir}/${target_filename}.${target_fileext}" "${target_dir}/${target_filename}_[000].${target_fileext}"
+	    check_err $?
+	    target_file="${target_dir}/${target_filename}_[001].${target_fileext}"
+	fi
+    fi
+    echo "[${c_yellow}$(basename $source_file)${c_h_blue} -> ${c_yellow}"${target_file}"${c_std}]"
+    cmd cp -v "${source_file}" "${target_file}"
+    check_err $?
+    cmd chmod -v 644 "${target_file}"
+    check_err $?
+}

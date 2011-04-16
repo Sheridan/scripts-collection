@@ -1,0 +1,17 @@
+#!/bin/bash
+
+. /etc/sheridan_sc/colors
+
+echo "\${c_std}"
+echo "${c_h_std}\${c_h_std}${c_std}"
+echo "${c_pink}\${c_pink}${c_std}"
+echo "${c_h_pink}\${c_h_pink}${c_std}"
+echo "${c_red}\${c_red}${c_std}"
+echo "${c_h_red}\${c_h_red}${c_std}"
+echo "${c_cayan}\${c_cayan}${c_std}"
+echo "${c_h_cayan}\${c_h_cayan}${c_std}"
+echo "${c_yellow}\${c_yellow}${c_std}"
+echo "${c_green}\${c_green}${c_std}"
+echo "${c_h_green}\${c_h_green}${c_std}"
+echo "${c_blue}\${c_blue}${c_std}"
+echo "${c_h_blue}\${c_h_blue}${c_std}"

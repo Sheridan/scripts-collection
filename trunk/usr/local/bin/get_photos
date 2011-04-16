@@ -1,0 +1,252 @@
+#!/bin/bash
+
+. /etc/sheridan_sc/global
+. /etc/sheridan_sc/colors
+. /etc/sheridan_sc/mplayer
+. ${prefix}/lib/sheridan_sc/common
+
+# Default source directory
+source=/mnt/flash/card_reader_sd_card/dcim/101sscam
+# Default destination directory
+target=~/tmp/photos
+
+# Temporally directory
+ph_temp=/tmp/photos
+# Log file for 2-pass video encoding
+passlogfile="/tmp/ph_passlog.log"
+# Temporally pcm file for sound encoding
+pcmtmpfile="/tmp/pcmtmp.wav"
+
+# Options for exiftool
+exiftool_opts="-t -S -m -q -q"
+# Video aspect
+aspect="4/3"
+
+# Regexp for jpeg files
+jpg_reg=".*[jJ][pP][eE]?[gG]"
+# Regexp for video files
+vid_reg=".*([aA][vV][iI]|[mM][oO][vV])"
+# Regexp for sound files
+snd_reg=".*[wW][aA][vV]"
+
+# Default clean source
+clean_source=1
+# Default processing flags
+process_photos=1
+process_videos=1
+process_sounds=1
+# misc options
+create_video_preview_shots=0
+verbose=0
+
+while [ $# -gt 0 ]
+do
+    case "$1" in
+        -s )
+            shift
+            source=$1
+        ;;
+        -t )
+            shift
+            target=$1
+        ;;
+	-n )
+	    clean_source=0
+        ;;
+	-np )
+	    process_photos=0
+        ;;
+	-nv )
+	    process_videos=0
+        ;;
+	-ns )
+	    process_sounds=0
+        ;;
+	-S )
+	    create_video_preview_shots=1
+        ;;
+	-v )
+	    verbose=1
+        ;;
+	--help | -h )
+            echo "
+        -h      This help
+        -s      Source folder (default ${source})
+        -t      Folder for store items (default ${target})
+	-n	No delete files from source 
+	-np	Skip copying photos
+	-nv	Skip copying video
+	-ns	Skip copying sounds
+	-S	Create video preview shots via get_video_preview_shot script
+	-v	Verbose output
+"
+            exit 0
+        ;;
+    esac
+    shift
+done
+
+script_start=`date +%s`
+mk_dir $ph_temp
+if (( $process_photos > 0 ))
+then
+    if find $source -type f | egrep -q "$jpg_reg"
+    then
+        photos_start=`date +%s`
+        regexp_files_cp "${jpg_reg}" "${source}" "${ph_temp}"
+        for file in $(find $ph_temp -type f | egrep "$jpg_reg" | sort)
+        do
+            createdate=`exiftool ${exiftool_opts} -d "%Y.%m.%d" -CreateDate ${file}`
+            check_err $?
+            createtime=`exiftool ${exiftool_opts} -d "%H-%M-%S" -CreateDate ${file}`
+            check_err $?
+            targetdir="${target}/${createdate}"
+            #targetfile="${targetdir}/${createtime}.jpg"
+	    targetfile="${createtime}"
+            #echo "[${c_yellow}$(basename $file)${c_h_blue} -> ${c_yellow}${createdate}/$(basename $targetfile)${c_std}]"
+	    if (( $verbose > 0 ))
+	    then
+        	echo "[${c_h_pink}File size      ${c_std}: ${c_h_green}`stat -c %s ${file}`${c_std}]"
+	        echo "[${c_h_pink}Create datetime${c_std}: ${c_h_green}${createdate} ${createtime}${c_std}]"
+    		echo "[${c_h_pink}Image size     ${c_std}: ${c_h_green}`exiftool ${exiftool_opts} -ImageSize ${file}`${c_std}]"
+    	        echo "[${c_h_pink}ISO            ${c_std}: ${c_h_green}`exiftool ${exiftool_opts} -ISO ${file}`${c_std}]"
+    	        echo "[${c_h_pink}Exposure Time  ${c_std}: ${c_h_green}`exiftool ${exiftool_opts} -ExposureTime ${file}`${c_std}]"
+    	        echo "[${c_h_pink}Aperture Value ${c_std}: ${c_h_green}`exiftool ${exiftool_opts} -ApertureValue ${file}`, `exiftool ${exiftool_opts} -MaxApertureValue ${file}`max.${c_std}]"
+    	        echo "[${c_h_pink}Resolution     ${c_std}: ${c_h_green}`exiftool ${exiftool_opts} -XResolution ${file}`x`exiftool ${exiftool_opts} -YResolution ${file}`${c_std}]"
+	    fi
+            mk_dir "${targetdir}"
+	    cp_uniq "${targetdir}" "${targetfile}" "jpg" "${file}"
+            echo
+        done
+        regexp_files_rm "${jpg_reg}" "${ph_temp}"
+        if (( $clean_source > 0 ))
+        then
+	    regexp_files_rm "${jpg_reg}" "${source}"
+        fi
+        echo "[${c_h_cayan}Photos copying time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $photos_start)) )${c_std}]"
+    fi
+fi
+
+if (( $process_videos > 0 ))
+then
+    if find $source -type f | egrep -q "$vid_reg"
+    then
+        videos_start=`date +%s`
+        regexp_files_cp "${vid_reg}" "${source}" "${ph_temp}"
+	for file in $(find $ph_temp -type f | egrep "$vid_reg")
+        do
+	    chapter_start=`date +%s`
+            video_width=`midentify "${file}" | grep ID_VIDEO_WIDTH | sed -e "s/.*=//"`
+            video_heigt=`midentify "${file}" | grep ID_VIDEO_HEIGHT | sed -e "s/.*=//"`
+            video_bitrate=`midentify "${file}" | grep ID_VIDEO_BITRATE | sed -e "s/.*=//"`
+            video_fps=`midentify "${file}" | grep ID_VIDEO_FPS | sed -e "s/.*=//"`
+            createdate=`date -ur "${source}/$(basename $file)" +%Y.%m.%d`
+            createtime=`date -ur "${source}/$(basename $file)" +%H-%M-%S`
+            targetdir="${target}/${createdate}/video"
+            targetfile="${targetdir}/${createtime}.avi"
+            
+	    if (( $verbose > 0 ))
+	    then
+		echo "[${c_h_pink}File size      ${c_std}: ${c_h_green}`stat -c %s ${file}`${c_std}]"
+		echo "[${c_h_pink}Create datetime${c_std}: ${c_h_green}${createdate} ${createtime}${c_std}]"
+    	        echo "[${c_h_pink}Image size     ${c_std}: ${c_h_green}${video_width}x${video_heigt}${c_std}]"
+	        echo "[${c_h_pink}Bitrate        ${c_std}: ${c_h_green}${video_bitrate}${c_std}]"
+    	        echo "[${c_h_pink}FPS            ${c_std}: ${c_h_green}${video_fps}${c_std}]"
+	    fi
+	    echo "[${c_yellow}$(basename $file)${c_h_blue} -> ${c_yellow}${createdate}/video/$(basename $targetfile)${c_std}]"
+	    
+	    mk_dir "${targetdir}"
+    
+            mencoder_common="file://${file} -passlogfile ${passlogfile} ${mplayer_verbose} -fps ${video_fps} -ofps ${video_fps}"
+	    mencoder_filters="-vf hqdn3d,scale=${video_width}:${video_heigt}:0,dsize=${aspect},pp=hb/vb/dr/al/ci"
+            mencoder_video_codec="-ovc xvid -xvidencopts threads=2:bitrate=${video_bitrate}:qpel:vhq=4:aspect=${aspect}:pass"
+    
+            pass_start=`date +%s`
+            cmd mencoder ${mencoder_common} ${mencoder_filters} -o /dev/null -nosound ${mencoder_video_codec}=1
+            check_err $?
+            echo
+            echo "[${c_h_cayan}1st pass encoding time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $pass_start)) )${c_std}]"
+    
+    	    pass_start=`date +%s`
+            cmd mencoder ${mencoder_common} ${mencoder_filters} -o ${targetfile} -oac mp3lame -lameopts vbr=2:q=7:mode=3 ${mencoder_video_codec}=2
+            check_err $?
+            echo
+            echo "[${c_h_cayan}2st pass encoding time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $pass_start)) )${c_std}]"
+    
+    	    cmd chmod -v 644 ${targetfile}
+            check_err $?
+
+	    echo "[${c_h_cayan}Video encoding time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $chapter_start)) )${c_std}]"
+            cmd rm -vf ${passlogfile}
+            check_err $?
+	    
+	    if (( $create_video_preview_shots > 0 ))
+	    then
+		get_video_preview_shot -s "${targetfile}" -d "${targetdir}/${createtime}.png" -a "${aspect}"
+	    fi
+        done
+        regexp_files_rm "${vid_reg}" "${ph_temp}"
+        if (( $clean_source > 0 ))
+        then
+	    regexp_files_rm "${vid_reg}" "${source}"
+        fi
+        echo "[${c_h_cayan}Video copying time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $videos_start)) )${c_std}]"
+        echo
+    fi
+fi
+
+if (( $process_sounds > 0 ))
+then
+    if find $source -type f | egrep -q "$snd_reg"
+    then
+        sounds_start=`date +%s`
+        regexp_files_cp "${snd_reg}" "${source}" "${ph_temp}"
+        for file in $(find $ph_temp -type f | egrep "$snd_reg")
+        do
+	    audio_bitrate=`midentify "${file}" | grep ID_AUDIO_BITRATE | uniq | sed -e "s/.*=//"`
+	    audio_rate=`midentify "${file}" | egrep "ID_AUDIO_RATE=[1-9]" | sed -e "s/.*=//"`
+	    audio_channels=`midentify "${file}" | grep ID_AUDIO_NCH | uniq | sed -e "s/.*=//"`
+	    createdate=`date -ur "${source}/$(basename $file)" +%Y.%m.%d`
+            createtime=`date -ur "${source}/$(basename $file)" +%H-%M-%S`
+	    audio_bitwidth=$(( audio_bitrate / audio_rate ))
+	    audio_bitrate=$(( audio_bitrate / 1000 ))
+	    audio_rate=$(( audio_rate / 1000 ))
+            targetdir="${target}/${createdate}/sound"
+            targetfile="${targetdir}/${createtime}.mp3"
+	    audio_mode='m'
+	    if (( $audio_channels > 1 ))
+	    then
+		audio_mode='j'
+	    fi
+            
+	    if (( $verbose > 0 ))
+	    then
+        	echo "[${c_h_pink}File size      ${c_std}: ${c_h_green}`stat -c %s ${file}`${c_std}]"
+    	        echo "[${c_h_pink}Create datetime${c_std}: ${c_h_green}${createdate} ${createtime}${c_std}]"
+	        echo "[${c_h_pink}Sample rate    ${c_std}: ${c_h_green}${audio_rate}kHz${c_std}]"
+	        echo "[${c_h_pink}Bitrate        ${c_std}: ${c_h_green}${audio_bitrate}Kbps${c_std}]"
+	        echo "[${c_h_pink}Sample size    ${c_std}: ${c_h_green}${audio_bitwidth} bits${c_std}]"
+	        echo "[${c_h_pink}Channels       ${c_std}: ${c_h_green}${audio_channels}${c_std}]"
+	    fi
+	    echo "[${c_yellow}$(basename $file)${c_h_blue} -> ${c_yellow}${createdate}/sound/$(basename $targetfile)${c_std}]"
+	    
+            mk_dir "${targetdir}"
+    	
+	    cmd mplayer file://${file} ${mplayer_global} ${mplayer_verbose} -vc null -vo null -ao pcm:fast:file=${pcmtmpfile}
+	    check_err $?
+	    cmd lame -m ${audio_mode} -B ${audio_bitrate} -q 5 -V 5 --ta Photo_camera --tg 101 --tl ${createdate} --ty `date +%Y` --tt ${createdate}_${createtime} ${pcmtmpfile} ${targetfile}
+	    check_err $?
+	    cmd rm -vf ${pcmtmpfile}
+    	    echo
+        done
+        regexp_files_rm "${snd_reg}" "${ph_temp}"
+        if (( $clean_source > 0 ))
+        then
+	    regexp_files_rm "${snd_reg}" "${source}"
+        fi
+	echo "[${c_h_cayan}Sounds copying time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $sounds_start)) )${c_std}]"
+    fi
+fi
+
+cmd rmdir $ph_temp
+echo "[${c_h_cayan}Script executing time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $script_start)) )${c_std}]"

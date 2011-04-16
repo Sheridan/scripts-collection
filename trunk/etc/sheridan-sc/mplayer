@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# Global mplayer/mencoder verbose options
+mplayer_verbose="-noautosub -msglevel all=1:statusline=9"
+# Global mplayer/mencoder options
+mplayer_global="-loop 1"
+

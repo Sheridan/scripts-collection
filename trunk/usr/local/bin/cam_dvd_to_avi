@@ -1,0 +1,100 @@
+#!/bin/bash
+
+. /etc/sheridan_sc/global
+. /etc/sheridan_sc/colors
+. /etc/sheridan_sc/mplayer
+. ${prefix}/lib/sheridan_sc/common
+
+source=/dev/dvd
+destination=~/tmp/cam_dvd
+aspect="16/9"
+quality=2
+
+while [ $# -gt 0 ]
+do
+    case "$1" in
+        -q )
+            shift
+	    quality=$1
+        ;;
+        -s )
+            shift
+	    source=$1
+        ;;
+	-d )
+            shift
+	    destination=$1
+        ;;
+	-a )
+            shift
+	    aspect=$1
+        ;;
+        --help | -h )
+            echo "
+	-h	This help
+        -q	Qality. 1-10, 1 - as is (default ${quality})
+	-s	DVD device or path or dvd image (see mplayer option -dvd-device) (default ${source})
+	-d	Folder for store result avi (default ${destination})
+	-a	Aspect ratio [16/9|4/3] (default ${aspect})
+"
+            exit 0
+        ;;
+    esac
+    shift
+done
+
+start=`date +%s`
+
+mk_dir $destination
+destination="${destination}/`date +%Y.%m.%d`"
+mk_dir $destination
+
+for src in $source
+do
+    src_start=`date +%s`
+    disc_id=`midentify dvd:// -dvd-device $src | grep ID_DVD_DISC_ID | sed -e "s/.*=//"`
+    dest="${destination}/${disc_id}"
+    passlogfile="/tmp/passlog_${disc_id}.log"
+    mk_dir $dest
+    echo "[Source: ${c_h_green}${src}${c_std}]"
+    echo "[Result destination directory: ${c_h_green}${dest}${c_std}]"
+    titles=`midentify dvd:// -dvd-device $src | grep ID_DVD_TITLES | sed -e "s/.*=//"`
+    (( video_bitrate=`midentify dvd:// -dvd-device $src | grep ID_VIDEO_BITRATE | sed -e "s/.*=//"` / $quality ))
+    echo "[Titles: ${c_h_green}${titles}${c_std}]"
+    echo "[Result bitrate: ${c_h_green}$(( $video_bitrate/1000 ))${c_std} kb/s]"
+    for (( title=1; title<=titles; title++ ))
+    do
+        title_start=`date +%s`
+        chapters=`midentify dvd:// -dvd-device $src | grep ID_DVD_TITLE_${title}_CHAPTERS | sed -e "s/.*=//"`
+        echo "[Title ${c_h_green}${title}${c_std}. Chapters: ${c_h_green}${chapters}${c_std}]"
+        for (( chapter=1; chapter<=chapters; chapter++ ))
+        do
+    	    chapter_start=`date +%s`
+	    video_width=`midentify dvd:// -dvd-device $src -chapter ${chapter}-${chapter} | grep ID_VIDEO_WIDTH | sed -e "s/.*=//"`
+	    video_heigt=`midentify dvd:// -dvd-device $src -chapter ${chapter}-${chapter} | grep ID_VIDEO_HEIGHT | sed -e "s/.*=//"`
+	    echo "[Title ${c_h_green}${title}${c_std}. Chapter: ${c_h_green}${chapter}${c_std}. Size: ${c_h_green}${video_width}x${video_heigt}${c_std}]"
+	    result_file_name="title_${title}-chapter_${chapter}"
+	    
+	    mencoder_common="dvd://${title} -dvd-device ${src} -chapter ${chapter}-${chapter} -passlogfile ${passlogfile} ${mplayer_verbose}"
+    	    mencoder_filters="-vf hqdn3d,scale=${video_width}:${video_heigt}:1,dsize=${aspect},pp=hb/vb/dr/al/ci"
+	    mencoder_video_codec="-ovc xvid -xvidencopts threads=2:bitrate=${video_bitrate}:qpel:vhq=4:aspect=${aspect}:pass"
+	    
+	    pass_start=`date +%s`
+    	    cmd mencoder ${mencoder_common} ${mencoder_filters} -o /dev/null -nosound ${mencoder_video_codec}=1
+	    echo
+	    echo "[${c_h_cayan}1st pass encoding time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $pass_start)) )${c_std}]"
+	    
+	    pass_start=`date +%s`
+    	    cmd mencoder ${mencoder_common} ${mencoder_filters} -o ${dest}/${result_file_name}.avi -oac mp3lame -lameopts vbr=2:q=5 ${mencoder_video_codec}=2
+	    echo
+	    echo "[${c_h_cayan}2st pass encoding time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $pass_start)) )${c_std}]"
+	    
+	    echo "[${c_h_cayan}Chapter encoding time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $chapter_start)) )${c_std}]"
+	    rm -f ${passlogfile}
+	    #exit 0
+	done
+	echo "[${c_h_cayan}Title encoding time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $title_start)) )${c_std}]"
+    done
+    echo "[${c_h_cayan}Source ${src} encoding time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $src_start)) )${c_std}]"
+done
+echo "[${c_h_cayan}Total encoding time: ${c_h_pink}$( secunds_to_time $((`date +%s` - $start)) )${c_std}]"

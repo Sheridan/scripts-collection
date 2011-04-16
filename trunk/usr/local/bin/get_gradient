@@ -1,0 +1,311 @@
+#!/usr/bin/perl -w
+use strict;
+use POSIX; 
+
+my (@start_color, @end_color, $steps, $templates_file, $template, $out_as_line, @arrange, @mirror);
+my ($debug, $type, $parts, $mix) = (0, "linear", 1, 0);
+our $templates;
+
+sub max { my $max = $_[0] > $_[1] ? $_[0] : $_[1];  return $max > $_[2] ? $max : $_[2]; }
+sub min { my $max = $_[0] < $_[1] ? $_[0] : $_[1];  return $max < $_[2] ? $max : $_[2]; }
+
+sub rgb2hsv
+{
+    my ($r, $g, $b) = @_[0..2];
+    my ($max, $min) = ( max($r,$g,$b), min($r,$g,$b) );
+    return (
+		($max == $min		) ? 0 : 
+		($max == $r and $g >= $b) ? 60*(($g-$b)/($max-$min))	 :
+		($max == $r and $g < $b	) ? 60*(($g-$b)/($max-$min))+360 :
+		($max == $g		) ? 60*(($b-$r)/($max-$min))+120 :
+		($max == $b		) ? 60*(($r-$g)/($max-$min))+240 : 0, 
+	    ($max == 0) ? 0 : (1-($min/$max)) * 255,
+	     $max
+	    ); #Hue, Saturation, Value
+}
+
+sub hsv2rgb
+{
+    my ($h, $s, $v) = ( $_[0], $_[1] / 255, $_[2] );
+    my $hi = ($h/60)%6;
+    my $f  = ($h/60)-$hi;
+    my ($p, $q, $t) = ( $v*(1-$s), $v*(1-($f*$s)), $v*(1-((1-$f)*$s)) );
+    return
+	($hi == 0) ? ($v, $t, $p) :
+	($hi == 1) ? ($q, $v, $p) :
+	($hi == 2) ? ($p, $v, $t) :
+	($hi == 3) ? ($p, $q, $v) :
+	($hi == 4) ? ($t, $p, $v) :
+		     ($v, $p, $q);
+}
+
+sub radial_hsv
+{
+    my $h;
+    my ($lsteps, $direct)  = ($_[0]+1, $_[1]);
+    my @start_hsv = rgb2hsv(@_[2..4]);
+    my @end_hsv = rgb2hsv(@_[5..7]);
+    my @step_values =	(
+			(($direct eq "rcw") ? ($end_hsv[0]-$start_hsv[0]) : 360+($start_hsv[0]-$end_hsv[0]))/$lsteps,
+			($end_hsv[1]-$start_hsv[1])/$lsteps,
+			($end_hsv[2]-$start_hsv[2])/$lsteps
+			);
+    my @result = [$start_hsv[0], $start_hsv[1], $start_hsv[2]];
+    for (my $i=1; $i<=$lsteps; $i++)
+    {
+	$h = ($direct eq "rcw") ? $result[$i-1][0]+$step_values[0] : $result[$i-1][0]-$step_values[0];
+	push (@result, 
+		[
+			($h > 360) ? 360-$h :
+			($h < 0)   ? 360+$h : $h,
+		    $result[$i-1][1]+$step_values[1],
+		    $result[$i-1][2]+$step_values[2]
+		]
+	    );
+    }
+    return map { [hsv2rgb(@$_)] } @result;
+}
+
+sub linear_rgb
+{
+    my $lsteps = $_[0]+1;
+    my ($rs, $gs, $bs, $re, $ge, $be) = @_[1..6];
+    my @step_values =	(
+			($re-$rs)/$lsteps,
+			($ge-$gs)/$lsteps,
+			($be-$bs)/$lsteps
+			);
+    
+    my @result = [$rs,$gs,$bs];
+    for (my $i=1; $i<=$lsteps; $i++)
+    {
+	push (@result,
+		[
+		    $result[$i-1][0]+$step_values[0],
+		    $result[$i-1][1]+$step_values[1],
+		    $result[$i-1][2]+$step_values[2]
+		]
+	    );
+    }
+    return @result;
+}
+
+sub arrange
+{
+    my @colors = @_;
+    if	($parts > 1)
+    {
+	my $colors_count = scalar(@colors);
+	my ($colors_in_part, $extra_colors, $colors_index)  = (floor($colors_count/$parts), $colors_count%$parts, 0);
+	my ($arrg_colors, @result_colors);
+	for (my $part = 0; $part < $parts; $part++)
+	{
+	    my ($start, $end) = ($colors_in_part*$part, $colors_in_part*$part+$colors_in_part-1);
+	    push(@{$arrg_colors->{$part}}, @colors[${start}..${end}]);
+	    if ($mirror[$part] eq "m") { $arrg_colors->{$part} = [reverse(@{$arrg_colors->{$part}})]; }
+	}
+	if ($mix == 0) {
+	    foreach my $part (@arrange) {
+		push (@result_colors, @{$arrg_colors->{$part-1}}); } }
+	else {
+	    for (my $part_color = 0; $part_color <= $colors_in_part; $part_color++) {
+		for (my $part = 0; $part < $parts; $part++) {
+		    push (@result_colors, $arrg_colors->{$part}[$part_color]) if (defined($arrg_colors->{$part}[$part_color])); } } }
+	return @result_colors;
+    }
+    return @colors;
+}
+
+sub get_cmdline_option_value
+{
+    my ($short, $long) = @_[0..1];
+    foreach my $line (@ARGV)
+    {
+	my ($c, $p) = split(/=/,$line);
+	if ($c eq "-$short" or $c eq "--$long") { return defined($p) ? $p : 1; }
+    }
+    return undef;
+}
+
+sub get_templates_option_value
+{
+    return defined($templates_file) && exists ($templates->{$template}{$_[0]}) ? $templates->{$template}{$_[0]} : undef;
+}
+
+sub get_option_value
+{
+    my ($short, $long) = @_[0..1];
+    my $cmdv = get_cmdline_option_value($short, $long);
+    return defined ($cmdv) ? $cmdv : get_templates_option_value($long);
+}
+
+sub configure
+{
+    if ( defined(get_cmdline_option_value('h', 'help')) ) { help_out(); }
+    my $tmp;
+    $debug		= get_cmdline_option_value('d', 'debug');
+    $templates_file	= get_cmdline_option_value('T', 'templates');
+    $template		= get_cmdline_option_value('u', 'use-template');
+    if(defined($templates_file)) { check_templates(); }
+    
+    @start_color 	= map(hex,unpack('(A2)*', get_option_value('s', 'start-color')));
+    @end_color		= map(hex,unpack('(A2)*', get_option_value('e', 'end-color')));
+    $tmp		= get_option_value('m', 'mirror');	if(defined($tmp)) { @mirror	= split(/:/, $tmp); }
+    $tmp		= get_option_value('a', 'arrange');	if(defined($tmp)) { @arrange	= split(/:/, $tmp); }
+    $steps		= get_option_value('S', 'steps');
+    $type		= get_option_value('t', 'type');
+    $parts		= get_option_value('p', 'parts');
+    $mix		= get_option_value('M', 'mix');
+    $out_as_line	= get_option_value('l', 'line');
+    
+    if(!defined($parts) or $parts eq "no" or $parts < 1) { $parts = 1; }
+    check_configure_errors();
+}
+
+sub check_templates
+{
+    if (not defined ($templates_file) and defined ($template))	{ print STDERR "I do not know where i can get '$template' template. Tell me this with -T option\n";			exit 0; }
+    if (not defined ($template) and defined ($templates_file))	{ print STDERR "Why you tell me about templates file without -u option? I do not know what template i must use.\n";	exit 0; }
+    require $templates_file;
+    if (defined ($templates_file) and not exists($templates->{$template})) { print STDERR "I can not find '$template' template in templates file '$templates_file'\n";			exit 0; }
+}
+
+sub check_configure_errors
+{
+    if ($parts > 1 and scalar(@arrange) < $parts)	{ print STDERR "Arranges not defined or not completely defined\n";	exit 0; }
+    if ($parts > 1 and scalar(@mirror) < $parts)	{ print STDERR "Mirrors not defined or not completely defined\n";	exit 0; }
+    if (not defined $start_color[0])			{ print STDERR "Start color not defined\n";				exit 0; }
+    if (not defined $end_color[0])			{ print STDERR "End color not defined\n";				exit 0; }
+    if (not defined $steps)				{ print STDERR "Steps not defined\n";					exit 0; }
+}
+
+sub draw
+{
+    if($debug)
+    {
+	my ($gt, $sc, $ec, $sa, $pm, $mx) = (
+					($type eq "rcw")  ? "Radial clockwise" :
+					($type eq "rccw") ? "Radial counter-clockwise" :
+	    						    "Linear",
+				    sprintf("%02x%02x%02x",@start_color), 
+				    sprintf("%02x%02x%02x",@end_color),
+				    join(":", @arrange),
+				    join(":", @mirror),
+				    $mix == 1 ? "Mixed" : "Unmixed");
+	printf <<_;
+<html>
+<style type='text/css'>
+div { font-size: x-large; font-family: monospace; text-align: center; float: left; padding: 10px; }
+td, th { border-style: solid; border-width: 1px; }
+th { background-color:gray; }
+td.a { vertical-align: top; border-style: none; }
+</style>
+<body>
+<table align='center'>
+<tr><th colspan='3'>Options</th></tr>
+<tr><td class='a'>
+    <table>
+    <tr><th colspan='3'>Base</th></tr>
+    <tr><th>Description</th><th>Command line</th><th>Value</th></tr>
+    <tr><td>Start color</td><td>-s=$sc</td><td style='background-color:$sc;' align='center'><font color='$ec'>$sc</font></td></tr>
+    <tr><td>End color  </td><td>-e=$ec</td><td style='background-color:$ec;' align='center'><font color='$sc'>$ec</font></td></tr>
+    <tr><td>Steps</td><td>-S=$steps</td><td>$steps (total @{[$steps+2]})</td></tr>
+    <tr><td>Gradient type</td><td>-t=$type</td><td>$gt</td></tr>
+    </table>
+</td><td class='a'>
+    <table>
+    <tr><th colspan='3'>Parting</th></tr>
+    <tr><th>Description</th><th>Command line</th><th>Value</th></tr>
+    <tr><td>Color parts</td><td>-p=$parts</td><td>$parts</td></tr>
+    <tr><td>Mirrors</td><td>-m=$pm</td><td>$pm</td></tr>
+    <tr><td>Arrange</td><td>-a=$sa</td><td>$sa</td></tr>
+    <tr><td>Mix</td><td>-M=$mix</td><td>$mx</td></tr>
+    </table>
+</td><td class='a'>
+    <table>
+    <tr><th colspan='3'>Templates</th></tr>
+    <tr><th>Description</th><th>Command line</th><th>Value</th></tr>
+    <tr><td>Templates file</td><td>-T=$templates_file</td><td>$templates_file</td></tr>
+    <tr><td>Template</td><td>-u=$template</td><td>$template</td></tr>
+    </table>
+</td></tr>
+</table>
+<br/>
+_
+    }
+    
+    foreach my $color (arrange(($type eq "linear") ? linear_rgb($steps, @start_color, @end_color) : radial_hsv($steps, $type, @start_color, @end_color)))
+    {
+	$color = sprintf("%02x%02x%02x",@$color);
+	print ($debug ? "<div style='background-color:$color;'>$color</div>\n" : $color . ( defined($out_as_line) ? ":" : "\n"));
+    }
+
+    if($debug) { print "</body></html>\n"; }
+}
+
+sub help_out
+{
+    print <<_;
+-h, --help		This help
+-d, --debug		Debug output (html) (You can use it as 'get_colors -d ..... > ~/debug.html' and open ~/debug.html in browser)
+-l, --line              Output as line, delimited with ':' (000000:000001:...)
+
+
+----
+    Base options
+-s, --start-color	Start color (for example -s=000000)
+-e, --end-color		End color (for example -e=FFFFFF)
+-S, --steps		Gradient steps (for example -S=12)
+-t, --type		Gradient type: Linear (linear), Radial clockwise (rcw), Radial counter-clockwise (rccw), default: $type
+
+----
+    Color partying
+-p, --parts		Divide to parts: No divide (no) or number value, default: no
+-a, --arrange		Arrange parts (see -p). Numbers divided by ':'
+			For example -p=3 - default arrange - -a=1:2:3, but you can change it, for example -a=2:3:1
+-m, --mirror		Mirror parts (see -p) for every part, divided by ':'
+			May be Linear (l) or Mirror (m). Default: all linear
+			For example parts=3: -p=3 -a=l:m:l - first part linear, second part mirrored, third part linear.
+-M, --mix		Mix parts (see -p)
+
+----
+    Templates
+-T, --templates		Location of templates file
+-u, --use-template	Template from templates file (see -T)
+    Templates file example:
+-cut-
+#!/usr/bun/perl -w
+use strict;
+our \$templates =
+{
+    'name'	=>
+    {
+	'start-color'	=> '000000',
+	'end-color'	=> 'FFFFFF',
+	'steps'		=> 256,
+	'type'		=> 'rcw',
+	'parts'		=> 4,
+	'arrange'	=> '4:2:3:1',
+	'mirror'	=> 'l:m:l:m',
+	'mix'		=> 1,
+	'out-as-line'	=> 1
+    },
+    'other'	=>
+    {
+	'start-color'	=> '0000FF',
+	'end-color'	=> 'FF0000',
+	'steps'		=> 128,
+	'type'		=> 'rcw'
+    }
+};
+
+-cut-
+    Command line options have a highter priority then template options    
+-------------------------------------------
+Thank to authors of http://en.wikipedia.org/wiki/HSV_color_space
+_
+    exit 0;
+}
+
+configure();
+draw();

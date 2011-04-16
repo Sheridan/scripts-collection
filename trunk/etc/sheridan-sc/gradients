@@ -1,0 +1,27 @@
+#!/usr/bun/perl -w
+use strict;
+our $templates =
+{
+    'blue-red-4-mix'      =>
+    {
+        'start-color'   => '0000FF',
+        'end-color'     => 'FF0000',
+        'steps'         => 256,
+        'type'          => 'rcw',
+        'parts'         => 4,
+        'arrange'       => '4:2:3:1',
+        'mirror'        => 'l:l:l:l',
+        'mix'           => 1
+    },
+    'blue-red-2-mix'      =>
+    {
+        'start-color'   => '0000FF',
+        'end-color'     => 'FF0000',
+        'type'          => 'rcw',
+        'parts'         => 2,
+        'arrange'       => '2:1',
+        'mirror'        => 'm:m',
+        'mix'           => 1
+    }
+};
+
