@@ -1,0 +1,177 @@
+#!/sbin/runscript
+# Copyright 2009 Gorlow M. V. sheridan@stavcom.ru
+# Distributed under the terms of the GNU General Public License v2
+
+CFG_FILE="/etc/conf.d/aufs"
+. ${CFG_FILE}
+mountcount=0
+
+depend() {
+	after net
+	before nfs
+	before squid
+	provide storage
+}
+
+checkconfig() {
+	if [ ! -e ${CFG_FILE} ] ; then
+		eerror "You need an ${CFG_FILE} config file to up storage"
+		return 1
+	fi
+}
+
+mount_volume() {
+    volume=$1
+    if [ "${CHECK_FS}" == "yes" ]
+    then
+	einfo "Checking ${VOLUMES_DEV_SOURCE}/${volume}, please wait"
+	fsck.${VOLUMES_FS} -C1 -p ${VOLUMES_DEV_SOURCE}/${volume} | tee -a ${AUFS_LOGFILE} 2>&1
+    fi
+    ebegin "Mounting ${VOLUMES_DEV_SOURCE}/${volume}"
+    mount -t ${VOLUMES_FS} -o ro ${VOLUMES_DEV_SOURCE}/${volume} ${RUN_DIRECTORY}/tmp >> ${AUFS_LOGFILE} 2>&1
+    result=$?
+    if (($result > 0))
+    then
+	eend $result 
+	ewarning "Cannot mount ${VOLUMES_DEV_SOURCE}/${volume}, check options!"
+	if [ "${FORCE_MOUNT_IF_MISSED}" != "yes" ]
+	then
+	    return 1
+	fi
+    fi
+    mkdir -p ${RUN_DIRECTORY}/mounted/${volume}
+    printf "%0*d\n" 3 ${mountcount} > ${RUN_DIRECTORY}/mounted/${volume}/number
+    df -h | grep "${RUN_DIRECTORY}/tmp" | awk '{print $2;}' | sed -e 's/,/./ig' > ${RUN_DIRECTORY}/mounted/${volume}/size
+    umount ${RUN_DIRECTORY}/tmp >> ${AUFS_LOGFILE} 2>&1
+    ((mountcount++))
+    mountpoint="`cat ${RUN_DIRECTORY}/mounted/${volume}/number`_`echo \"${volume}\" | sed 's/.*\?-\(SATA_\)\?\(.*\)-part\(.*\)/\2_p\3/'`_`cat ${RUN_DIRECTORY}/mounted/${volume}/size`"
+    echo ${mountpoint} > ${RUN_DIRECTORY}/mounted/${volume}/mountpoint
+    mkdir -p ${VOLUMES_MOUNTPOINT}/${mountpoint}
+    mount -t ${VOLUMES_FS} ${VOLUMES_DEV_SOURCE}/${volume} ${VOLUMES_MOUNTPOINT}/${mountpoint} >> ${AUFS_LOGFILE} 2>&1
+    eend 0
+    return 0
+}
+
+umount_volume() {
+    volume=$1
+    ebegin "Unmounting ${VOLUMES_DEV_SOURCE}/${volume}"
+    umount -v ${VOLUMES_DEV_SOURCE}/${volume} >> ${AUFS_LOGFILE} 2>&1
+    result=$?
+    if (($result > 0))
+    then
+	eend $result 
+	eerror "Cannot unmount ${VOLUMES_DEV_SOURCE}/${volume}, check it!"
+	return 1
+    fi
+    mountpoint=`cat ${RUN_DIRECTORY}/mounted/${volume}/mountpoint`
+    rmdir ${VOLUMES_MOUNTPOINT}/${mountpoint} >> ${AUFS_LOGFILE} 2>&1
+    eend 0
+    return 0
+}
+
+umount_volumes() {
+	sync
+	for volume in $(ls -1 ${RUN_DIRECTORY}/mounted/)
+	do
+	    umount_volume ${volume}
+	    if (($? > 0))
+	    then
+		return 1
+	    fi
+	done
+	return 0
+}
+
+
+prepare_context() {
+	remove_context
+	echo "---------------------------------------------------------------" >> ${AUFS_LOGFILE}
+	mkdir -p ${RUN_DIRECTORY}/mounted
+	mkdir -p ${RUN_DIRECTORY}/tmp
+}
+
+remove_context() {
+	rm -rf ${RUN_DIRECTORY}
+}
+
+start() {
+	checkconfig || return 1
+	prepare_context
+	einfo "Storage starting up..."
+	for volume in ${VOLUMES}
+	do
+	    mount_volume ${volume}
+	    if (($? == 1))
+	    then
+		umount_volumes
+		eerror "Can not up storage!"
+		return 1
+	    fi
+	done
+	points=""
+	for volume in ${VOLUMES}
+	do
+	    if [ -d "${RUN_DIRECTORY}/mounted/${volume}" ]
+	    then
+		points="${points}:${VOLUMES_MOUNTPOINT}/`cat ${RUN_DIRECTORY}/mounted/${volume}/mountpoint`=rw"
+	    fi
+	done
+	#points=`echo "${points}" | sed -e 's/:\(.*\)/\1/'`
+	ebegin "Starting up AUFS"
+	aufs_xino_file="${RUN_DIRECTORY}/.aufs.xino"
+	#touch ${aufs_xino_file}
+	min_size=$((1024*1024*1024))
+	command="mount -t aufs -o rw,xino=${aufs_xino_file},br${points},create=mfsrr:${min_size}:5,cpup=bu,udba=reval,verbose,sum none ${STORAGE_MOUNTPOINT}"
+	echo ${command} >> ${AUFS_LOGFILE}
+	${command} >> ${AUFS_LOGFILE} 2>&1
+	result=$?
+	eend $result
+	if (($result > 0))
+	then
+	    umount_volumes
+	    eerror "Can not start AUFS!"
+	    return 1
+	else
+	    touch "${RUN_DIRECTORY}/aufs_mounted"
+	fi
+	if [ -x ${AFTER_UP} ]
+	then
+	    ebegin "Script"
+	    ${AFTER_UP} >> ${AUFS_LOGFILE} 2>&1
+	    eend $?
+	fi
+	return 0
+}
+
+stop() {
+	einfo "Storage shutting down..."
+	if [ -e "${RUN_DIRECTORY}/aufs_mounted" ]
+	then
+	    fuser -mu ${STORAGE_MOUNTPOINT} >> ${AUFS_LOGFILE} 2>&1
+	    if (($? == 0))
+	    then
+	        eerror "Storage in use! Cannot unmount!"
+	        return 1
+	    fi
+	    if [ -x ${BEFORE_DOWN} ]
+	    then
+	        ebegin "Script"
+	        ${BEFORE_DOWN} >> ${AUFS_LOGFILE} 2>&1
+	        eend $?
+	    fi
+	    umount ${STORAGE_MOUNTPOINT} >> ${AUFS_LOGFILE} 2>&1
+	    if (($? == 0))
+	    then
+	        rm -f "${RUN_DIRECTORY}/aufs_mounted"
+	    fi
+	fi
+	#umount ${STORAGE_MOUNTPOINT} >> ${AUFS_LOGFILE} 2>&1
+	umount_volumes
+	if (($? == 1))
+	then
+	    eerror "Can not down storage!"
+	    return 1
+	fi
+	remove_context
+	return 0
+}
