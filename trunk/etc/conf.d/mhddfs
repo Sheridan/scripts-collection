@@ -1,0 +1,31 @@
+#!/bin/bash
+# Config file for /etc/init.d/storage
+
+# Volumes 
+VOLUMES_DEV_SOURCE="/dev/disk/by-id" 
+VOLUMES="ata-WDC_WD5000AADS-00L4B1_WD-WCAUH1200105-part1"
+VOLUMES="${VOLUMES} scsi-SATA_SAMSUNG_SV0411NS01RJ10X980875-part1"
+VOLUMES="${VOLUMES} scsi-SATA_ST340810A_3FB13Y0W-part1"
+VOLUMES="${VOLUMES} scsi-SATA_WDC_WD1600AAJB-_WD-WMAP98914216-part2"
+VOLUMES="${VOLUMES} scsi-SATA_FUJITSU_MPC3032_05073571-part1"
+VOLUMES_FS="ext3"
+VOLUMES_MOUNTPOINT="/mnt/storage/volumes"
+STORAGE_MOUNTPOINT="/mnt/storage/data"
+RUN_DIRECTORY="/var/run/mhddfs"
+
+LOGGING="no"
+
+# Mount storage if one or more volumes cannot muount
+FORCE_MOUNT_IF_MISSED="yes"
+
+# See man mhddfs for MHDDFS_* options
+MHDDFS_LOGFILE="/var/log/mhddfs.log"
+MHDDFS_LOGLEVEL=2
+MHDDFS_MLIMIT="1Gb"
+
+# Checking volumes (running fsck.$VOLUMES_FS -p)
+CHECK_FS="yes"
+
+# Scripts
+AFTER_UP="/usr/local/bin/mhddfs_after_up"
+BEFORE_DOWN="/usr/local/bin/mhddfs_before_down"
