@@ -1,0 +1,22 @@
+#!/bin/bash
+
+src_directoryes="/var/www /var/svn /var/spool"
+dest_directoryes="/storage/volume_0/backup/ /storage/volume_1/backup/"
+temp_dir="/var/tmp/bu"
+mkdir -p $temp_dir
+for src_dir in $src_directoryes
+do
+    bu_name="bu_${src_dir//\//_}.tar.bz2"
+    #echo $bu_name
+    tar --totals -C $src_dir -cf - ./ | bzip2 --best -f > ${temp_dir}/${bu_name}
+    for dest_dir in $dest_directoryes
+    do
+	if [ -e ${dest_dir}/${bu_name} ]
+	then
+	    mv -f ${dest_dir}/${bu_name} ${dest_dir}/prev_${bu_name}
+	fi
+	cp -v ${temp_dir}/${bu_name} ${dest_dir}/${bu_name}
+    done
+    rm ${temp_dir}/${bu_name}
+done
+rm -rf $temp_dir
