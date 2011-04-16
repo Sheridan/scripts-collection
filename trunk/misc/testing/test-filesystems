@@ -1,0 +1,555 @@
+#!/usr/bin/perl -w
+
+use strict;
+use POSIX;
+use Time::HiRes;
+use Filesys::Df;
+
+my $debug = 0;
+my $mount_point = '/mnt/tmp';
+my $report_path = '/tmp/_filesystem-test-report_';
+my $temp_directory = '/mnt/tmpfs';
+my $test_data_source = '/dev/zero';
+my $vd_mount_point = '/mnt/tmpvd';
+my $vd_size = 67108864;
+my $partition = sprintf("%s/disk.img", $vd_mount_point);
+my $test_data_sizes = # bytes -> count of files; 0 == calculate maximum
+{
+    1024*12 => 100,
+    1048576 => 1,
+    8388608 => 1,
+    16777216 => 1,
+    67108864 => 1
+#   200000000 => 1
+};
+my $iterations = 3;
+my $iteration = 0;
+my $fs = 
+{
+#    'bfs'	=> { 'format' => "mkfs -t bfs ${partition}"		, 'mount' => "mount -t bfs -o loop ${partition} ${mount_point}"		, 'umount' => "umount ${mount_point}" },
+#    'xfs'	=> { 'format' => "mkfs -t xfs -f ${partition}"		, 'mount' => "mount -t xfs -o loop ${partition} ${mount_point}"		, 'umount' => "umount ${mount_point}" },
+#    'ext2'	=> { 'format' => "mkfs -t ext2 -F ${partition}"		, 'mount' => "mount -t ext2 -o loop ${partition} ${mount_point}"	, 'umount' => "umount ${mount_point}" },
+    'ext3'	=> { 'format' => "mkfs -t ext3 -F ${partition}"		, 'mount' => "mount -t ext3 -o loop ${partition} ${mount_point}"	, 'umount' => "umount ${mount_point}" },
+#    'ext4dev'	=> { 'format' => "mkfs -t ext3 ${partition}"		, 'mount' => "mount -t ext3 -o loop ${partition} ${mount_point}"	, 'umount' => "umount ${mount_point}" },
+    'reiserfs'	=> { 'format' => "mkfs -t reiserfs -f -f ${partition}"	, 'mount' => "mount -t reiserfs -o loop ${partition} ${mount_point}"	, 'umount' => "umount ${mount_point}" }
+#    'reiser4'	=> { 'format' => "mkfs -t reiser4 -y ${partition}"	, 'mount' => "mount -t reiser4 -o loop ${partition} ${mount_point}"	, 'umount' => "umount ${mount_point}" },
+#    'fat32'	=> { 'format' => "mkfs -t vfat -F 32 ${partition}"	, 'mount' => "mount -t vfat -o loop ${partition} ${mount_point}"	, 'umount' => "umount ${mount_point}" },
+#    'tmpfs'	=> { 'format' => "true"					, 'mount' => "mount -t tmpfs tmpfs ${mount_point}"			, 'umount' => "umount ${mount_point}" },
+#    'fat16'	=> { 'format' => "mkfs -t vfat -F 16 ${partition}"	, 'mount' => "mount -t vfat -o loop ${partition} ${mount_point}"	, 'umount' => "umount ${mount_point}" },
+#    'minix'	=> { 'format' => "mkfs -t minix ${partition}"		, 'mount' => "mount -t minix -o loop ${partition} ${mount_point}"	, 'umount' => "umount ${mount_point}" },
+#    'minix2'	=> { 'format' => "mkfs -t minix -v ${partition}"	, 'mount' => "mount -t minix -o loop ${partition} ${mount_point}"	, 'umount' => "umount ${mount_point}" },
+#    'ntfs'	=> { 'format' => "mkfs -t ntfs -F ${partition}"		, 'mount' => "mount -t ntfs -o loop,rw ${partition} ${mount_point}"	, 'umount' => "umount ${mount_point}" }
+#    'ntfs-3g'	=> { 'format' => "mkfs -t ntfs -F ${partition}"		, 'mount' => "mount -t ntfs-3g -o loop ${partition} ${mount_point}"	, 'umount' => "umount ${mount_point}" }
+#    'zfs'	=> { 'format' => "zpool create testzfs ${partition} && zfs create testfs/first && zfs set mountpoint=${mount_point} testfs/first", 'mount' => "zfs mount", 'umount' => "zfs umount ${mount_point}", 'destroy' => "zfs destroy testfs/first && zpool destroy testfs", 'pre-bench' => '/etc/init.d/zfs-fuse start', 'post-bench' => '/etc/init.d/zfs-fuse stop' }
+};
+
+my $bench_data;
+my $real_disk_size;
+
+#my $gg = `which get_gradient 2>/dev/null`; chomp($gg);
+
+sub debug_print
+{
+    my $line = $_[0];
+    printf("[Debug] %s\n", $line);
+}
+
+sub prepare_fileset
+{
+    my $s_bench = [Time::HiRes::gettimeofday()];
+    my $real_img_size = $vd_size + ceil(($vd_size/100)*30);
+    my $real_vd_size = $real_img_size + (1048576);
+    $real_disk_size = $real_vd_size;
+    printf("Creating %db [%db real] tmpfs volume\n", $vd_size, $real_vd_size);
+    system_command("mount -t tmpfs -o size=${real_vd_size} tmpfs ${vd_mount_point}") or return 0;
+    system_command("dd if=/dev/zero of=${partition} bs=${real_img_size} count=1") or return 0;
+    
+    my $total_size = 0;
+    foreach my $size (sort keys %{$test_data_sizes})
+    {
+	if($test_data_sizes->{$size} == 0)
+	{
+	    $test_data_sizes->{$size} = floor($vd_size/$size);
+	}
+	$total_size += $test_data_sizes->{$size}*$size;
+	printf("Maximum %db files count on this ramdisk: %s\n", $size, floor($vd_size/$size));
+    }
+    printf("Total test-data size %db\n", $total_size);
+    $total_size = $total_size + floor(($total_size/100)*10);
+    printf("Creating %db tmpfs volume\n", $total_size);
+    system_command("mount -t tmpfs -o size=${total_size} tmpfs ${temp_directory}") or return 0;
+    foreach my $size (sort keys %{$test_data_sizes})
+    {
+	printf("Generating %s %s-size files. Total %s bytes\n", $test_data_sizes->{$size}, $size, $test_data_sizes->{$size}*$size);
+	system_command("mkdir -p ${temp_directory}/${size}");
+	for(my $i = 0; $i < $test_data_sizes->{$size}; $i++)
+	{
+	    system_command("dd if=${test_data_source} of=${temp_directory}/${size}/${i} bs=${size} count=1") or return 0;
+	}
+    }
+    my $e_bench = [Time::HiRes::gettimeofday()];
+    my $bench_diff = Time::HiRes::tv_interval($s_bench, $e_bench);
+    printf("Time spent while creating files: %s\n", $bench_diff);
+    return 1;
+}
+
+sub remove_fileset
+{
+    #system_command("rm -rf ${temp_directory}");
+    system_command('sync && sync');
+    system_command("umount ${temp_directory}");
+    system_command("umount ${vd_mount_point}");
+}
+
+sub system_command
+{
+    my $command = $_[0];
+    if($debug) { debug_print(sprintf("System command: %s", $command)); }
+    my $result = system "${command} > /tmp/test-filesystems.out 2>&1";
+    if($debug) { debug_print(sprintf("System command result: %d", $result)); }
+    if($result != 0)
+    {
+	printf ("Command [%s] failed\n", $command);
+	system "cat /tmp/test-filesystems.out";
+    }
+    return $result == 0;
+}
+
+sub bench_command
+{
+    my ($fs_name, $bench_name, $command, $caption) = @_[0..3];
+    if($debug) { debug_print(sprintf("Bench command: %s", $command)); }
+    my $log_filename = sprintf("%s/log/%s_%s_%s.log", $report_path, $fs_name, $bench_name, $iteration);
+    my $real_command = sprintf("%s > %s 2>&1 && sync", $command, $log_filename);
+    system_command('sync && sync');
+    my $s_bench = [Time::HiRes::gettimeofday()];
+    my $result = system $real_command;
+    my $e_bench = [Time::HiRes::gettimeofday()];
+    if($result == 0)
+    {
+	my $bench_diff = Time::HiRes::tv_interval($s_bench, $e_bench);
+	append_bench_data('time', $fs_name, $caption, $bench_name, $bench_diff, $command);
+    }
+    else 
+    {
+	printf("Bench [%s] failed\n$!\n", $command);
+	system "cat ${log_filename}";
+    }
+    if($debug) { debug_print(sprintf("Bench command result: %d", $result)); }
+    return $result == 0;
+}
+
+
+
+sub bench_fs
+{
+    my $fs_name = $_[0];
+    if(bench_command($fs_name, 'mount', $fs->{$fs_name}{'mount'}, "Mount time"))
+    {
+	append_bench_data('size', $fs_name, "After format", 'aformat', df($mount_point, 1));
+	if( bench_command($fs_name, "mkdir", "mkdir -p ${mount_point}/a", "Make directory time") && 
+	    bench_command($fs_name, "mkdir", "mkdir -p ${mount_point}/b", "Make directory time"))
+	{
+	    append_bench_data('size', $fs_name, "After making directoryes", 'amkdir', df($mount_point, 1));
+	    foreach my $size (keys %{$test_data_sizes})
+	    {
+		my $job_name_tail = sprintf("%d_%d", $test_data_sizes->{$size}, $size);
+		my $job_caption_tail = sprintf("%d files, %d bytes per file", $test_data_sizes->{$size}, $size);
+		if(bench_command($fs_name, sprintf("copy_%s", $job_name_tail), "cp ${temp_directory}/${size}/* ${mount_point}/a", sprintf("Copying %s", $job_caption_tail)))
+		{
+		    append_bench_data('size', $fs_name, sprintf("After copying %s", $job_caption_tail), sprintf("acopy_%s", $job_name_tail), df($mount_point, 1));
+		    if(bench_command($fs_name, sprintf("move_%s", $job_name_tail), "mv -f ${mount_point}/a/* ${mount_point}/b", sprintf("Moving %s", $job_caption_tail)))
+		    {
+			append_bench_data('size', $fs_name, sprintf("After moving %s", $job_caption_tail), sprintf("amove_%s", $job_name_tail), df($mount_point, 1));
+			if(!bench_command($fs_name, sprintf("remove_%s", $job_name_tail), "rm -f ${mount_point}/b/*", sprintf("Removing %s", $job_caption_tail)))
+			{
+			    last;
+			}
+			append_bench_data('size', $fs_name, sprintf("After removing %s", $job_caption_tail), sprintf("aremove_%s", $job_name_tail), df($mount_point, 1));
+		    }
+		}
+	    }
+	}
+	system_command('sync && sync');
+	bench_command($fs_name, 'umount', $fs->{$fs_name}{'umount'}, "Unmount time");
+    }
+}
+
+sub main
+{
+    my $s_bench = [Time::HiRes::gettimeofday()];
+    system_command("mkdir -p ${report_path}/log");
+    if(prepare_fileset())
+    {
+	for(; $iteration<$iterations; $iteration++)
+	{
+	    foreach my $fs_name ( sort keys %{$fs} )
+	    {
+		if(defined($fs->{$fs_name}{'pre-bench'})) { system_command($fs->{$fs_name}{'pre-bench'}); }
+    		#printf("File system: %s\n", $fs_name);
+		if(bench_command($fs_name, 'format', $fs->{$fs_name}{'format'}, "Formatting time"))
+		{
+		    system_command('sync && sync');
+		    bench_fs($fs_name);
+		    if(defined($fs->{$fs_name}{'destroy'})) { bench_command($fs_name, 'destroy', $fs->{$fs_name}{'destroy'}, "Destroy time"); }
+		}
+		if(defined($fs->{$fs_name}{'post-bench'})) { system_command($fs->{$fs_name}{'post-bench'}); }
+	    }
+	}
+	make_averages_bench_data();
+	$| = 1;
+	print_result();
+    }
+    remove_fileset();
+    my $e_bench = [Time::HiRes::gettimeofday()];
+    my $bench_diff = Time::HiRes::tv_interval($s_bench, $e_bench);
+    printf("Total time spent: %s\n", $bench_diff);
+}
+
+sub append_bench_data
+{
+    my ($type, $fs_name, $caption, $job_name) = @_[0..3];
+    printf("Iteration %d, filesystem %s, task %s ", $iteration, $fs_name, $caption);
+    $bench_data->{'captions'}{$job_name} = $caption;
+    if($type eq 'size')
+    {
+	my ($size_data) = $_[4];
+	printf("Used size: %d\n", $size_data->{'used'});
+	my $spn_count = 0;
+	if(!defined($bench_data->{'captions'}{$type}{$fs_name}{'names'})) { push(@{$bench_data->{'captions'}{$type}{$fs_name}{'names'}}, keys(%{$size_data})); }
+	push(@{$bench_data->{'iterations'}{$type}{$fs_name}{$job_name}{'values'}[$iteration]}, values(%{$size_data}));
+	foreach my $size_part_name (keys %{$size_data})
+	{
+	    if(!defined($size_data->{$size_part_name})) { next; }
+	    
+	    @{$bench_data->{'iterations'}{$type}{$fs_name}{$job_name}{'same_values'}{$size_part_name}}[$iteration] = $size_data->{$size_part_name};
+	    
+            if(defined(@{$bench_data->{'average'}{$type}{$fs_name}{$job_name}{'values'}{'summ'}}[$spn_count]))
+            {
+                @{$bench_data->{'average'}{$type}{$fs_name}{$job_name}{'values'}{'summ'}}[$spn_count] += $size_data->{$size_part_name};
+            }
+    	    else
+            {
+                push(@{$bench_data->{'average'}{$type}{$fs_name}{$job_name}{'values'}{'summ'}}, $size_data->{$size_part_name});
+            }
+	    $spn_count++;
+	}
+    }
+    elsif ($type eq 'time')
+    {
+	my ($time_data, $command) = @_[4..5];
+	printf("Time spent: %s\n", $time_data);
+	push(@{$bench_data->{'iterations'}{$type}{$fs_name}{$job_name}{'values'}}, $time_data);
+	$bench_data->{'iterations'}{$type}{$fs_name}{$job_name}{'command'} = $command;
+	
+	my $arr_cnt = 0;
+	my $exists = 0;
+	foreach my $arr_spn (@{$bench_data->{'average'}{$type}{$fs_name}{'names'}})
+	{
+	    if($arr_spn eq $job_name)
+	    {
+	        $exists = 1;
+	        @{$bench_data->{'average'}{$type}{$fs_name}{'values'}{'count'}}[$arr_cnt]++;
+	        @{$bench_data->{'average'}{$type}{$fs_name}{'values'}{'summ'}}[$arr_cnt] += $time_data;
+	    }
+	    $arr_cnt++;
+	}
+	    
+	if(!$exists)
+	{
+	    push(@{$bench_data->{'average'}{$type}{$fs_name}{'names'}}, $job_name);
+	    push(@{$bench_data->{'average'}{$type}{$fs_name}{'values'}{'count'}}, 1);
+	    push(@{$bench_data->{'average'}{$type}{$fs_name}{'values'}{'summ'}}, $time_data);
+	}
+	
+    }
+}
+
+sub make_averages_bench_data
+{
+    foreach my $type (sort keys %{$bench_data->{'average'}})
+    {
+	foreach my $fs_name (sort keys %{$bench_data->{'average'}{$type}})
+	{
+	    if($type eq 'time')
+	    {
+	        my $c_count = scalar(@{$bench_data->{'average'}{$type}{$fs_name}{'values'}{'count'}});
+	        my $values;
+	        for(my $i = 0; $i < $c_count; $i++)
+	        {
+	    	    push(@{$values}, @{$bench_data->{'average'}{$type}{$fs_name}{'values'}{'summ'}}[$i]/@{$bench_data->{'average'}{$type}{$fs_name}{'values'}{'count'}}[$i])
+		}
+		$bench_data->{'average'}{$type}{$fs_name}{'values'} = $values;
+	    }
+	    elsif($type eq 'size')
+	    {
+		foreach my $job_name (sort keys %{$bench_data->{'average'}{$type}{$fs_name}})
+		{    
+		    my $values;
+		    my $c_count = scalar(@{$bench_data->{'average'}{$type}{$fs_name}{$job_name}{'values'}{'summ'}});
+		    for(my $i = 0; $i < $c_count; $i++)
+		    {
+			push(@{$values}, @{$bench_data->{'average'}{$type}{$fs_name}{$job_name}{'values'}{'summ'}}[$i]/$iterations);
+		    }
+		    $bench_data->{'average'}{$type}{$fs_name}{$job_name}{'values'} = $values;
+		}
+	    }
+	}
+    }
+}
+
+use Data::Dumper;
+use GD::Graph;
+use GD::Graph::colour qw(:colours);
+use GD::Graph::bars;
+use GD::Graph::lines;
+#use GD::Text;
+
+sub print_result
+{
+    my $d = Data::Dumper->new([$bench_data]);
+    $d->Indent(1);
+    print $d->Dump; print "\n";
+    my $index_fh = open_html_page('index');
+    print ("Graph");
+    print_time_result($index_fh);
+    print_size_result($index_fh);
+    print ("Done\n");
+    close_html_page($index_fh);
+}
+
+sub print_time_result
+{
+    my ($index_page_fh) = $_[0];
+    my $timep_fh = open_html_page('atime');
+    print { $index_page_fh } "<br /><b>Times</b><br /><a href='atime.html'>Average times</a><br />\n";
+    
+    
+    foreach my $fs_name ( keys %{$bench_data->{'average'}{'time'}})
+    {
+	my $names;
+	foreach my $job_name (@{$bench_data->{'average'}{'time'}{$fs_name}{'names'}})
+	{
+	    push(@$names, $bench_data->{'captions'}{$job_name})
+	}
+	my $caption = sprintf("Average times of %s", $fs_name);
+	my $img_filename = draw	(
+				    'hbars',
+				    sprintf("average_time_%s", $fs_name),
+				    $caption,
+				    'Names',
+				    'Seconds',
+				    $names,
+				    $bench_data->{'average'}{'time'}{$fs_name}{'values'}
+				);
+	post_image($timep_fh, $img_filename, $caption);
+    }
+    close_html_page($timep_fh);
+    $timep_fh = open_html_page('itime');
+    print { $index_page_fh } "<a href='itime.html'>Every iteration times</a><br />\n";
+    foreach my $fs_name ( keys %{$bench_data->{'iterations'}{'time'}})
+    {
+	foreach my $job_name ( keys %{$bench_data->{'iterations'}{'time'}{$fs_name}})
+	{
+	    my $caption = sprintf("Filesystem %s. %s", $fs_name, $bench_data->{'captions'}{$job_name});
+	    my $img_filename = draw(
+				    'lines',
+				    sprintf("iterations_times_%s_%s", $fs_name, $job_name),
+				    $caption,
+				    'Names',
+				    'Seconds',
+				    'Iteration',
+				    $bench_data->{'iterations'}{'time'}{$fs_name}{$job_name}{'values'}
+				);
+	    post_image($timep_fh, $img_filename, $caption, $bench_data->{'iterations'}{'time'}{$fs_name}{$job_name}{'command'});
+	}
+    }
+    close_html_page($timep_fh);
+}
+
+sub print_size_result
+{
+    my ($index_page_fh) = $_[0];
+    my $sizep_fh = open_html_page('afssize');
+    print { $index_page_fh } "<br /><b>Sizes</b><br /><a href='afssize.html'>Average sizes per filesystem</a><br />\n";
+    foreach my $fs_name ( keys %{$bench_data->{'average'}{'size'}})
+    {
+	foreach my $job_name ( keys %{$bench_data->{'iterations'}{'size'}{$fs_name}})
+	{
+	    my $caption = sprintf("Average sizes of %s. %s", $fs_name, $bench_data->{'captions'}{$job_name});
+	    my $img_filename = draw	(
+					    'hbars',
+					    sprintf("average_size_%s_%s", $fs_name, $job_name),
+					    $caption,
+					    'Names',
+					    'Bytes',
+					    $bench_data->{'captions'}{'size'}{$fs_name}{'names'},
+					    $bench_data->{'average'}{'size'}{$fs_name}{$job_name}{'values'}
+					);
+	    post_image($sizep_fh, $img_filename, $caption);
+	}
+    }
+    close_html_page($sizep_fh);
+    $sizep_fh = open_html_page('ifssize');
+    print { $index_page_fh } "<a href='ifssize.html'>Every iteration sizes per filesystem</a><br />\n";
+    foreach my $fs_name ( keys %{$bench_data->{'iterations'}{'size'}})
+    {
+	foreach my $job_name ( keys %{$bench_data->{'iterations'}{'size'}{$fs_name}})
+	{
+	    for(my$i=0;$i<$iterations;$i++)
+	    {
+		my $caption = sprintf("Iteration %d. Filesystem %s. %s", $i+1, $fs_name, $bench_data->{'captions'}{$job_name});
+		my $img_filename = draw(
+					    'hbars',
+					    sprintf("iterations_fssizes_%s_%s_%d", $fs_name, $job_name, $i),
+					    $caption,
+					    'Names',
+					    'Bytes',
+					    $bench_data->{'captions'}{'size'}{$fs_name}{'names'},
+					    $bench_data->{'iterations'}{'size'}{$fs_name}{$job_name}{'values'}[$i]
+					    );
+		post_image($sizep_fh, $img_filename, $caption);
+	    }
+	}
+    }
+    close_html_page($sizep_fh);
+    #@{$bench_data->{'iterations'}{$type}{$fs_name}{$job_name}{'same_values'}{$size_part_name}}[$iteration] = $size_data->{$size_part_name};
+    $sizep_fh = open_html_page('isamesize');
+    print { $index_page_fh } "<a href='isamesize.html'>Every iteration sizes per type</a><br />\n";
+    foreach my $fs_name ( keys %{$bench_data->{'iterations'}{'size'}})
+    {
+	foreach my $job_name ( keys %{$bench_data->{'iterations'}{'size'}{$fs_name}} )
+	{
+	    foreach my $size_part ( keys %{$bench_data->{'iterations'}{'size'}{$fs_name}{$job_name}{'same_values'}} )
+	    {
+		for(my$i=0;$i<$iterations;$i++)
+		{
+		    my $caption = sprintf("Iteration %d. Filesystem %s. Size type %s. %s", $i+1, $fs_name, $size_part, $bench_data->{'captions'}{$job_name});
+		    my $img_filename = draw(
+					    'lines',
+					    sprintf("iterations_samesizes_%s_%s_%d", $fs_name, $job_name, $i),
+					    $caption,
+					    'Names',
+					    'Bytes',
+					    'Iteration',
+					    $bench_data->{'iterations'}{'size'}{$fs_name}{$job_name}{'same_values'}{$size_part}
+					    );
+		    post_image($sizep_fh, $img_filename, $caption);
+		}
+	    }
+	}
+    }
+    close_html_page($sizep_fh);
+}
+
+sub post_image
+{
+    my ($page_fh, $img_filename, $caption, $description) = @_[0..3];
+    $description = defined($description) ? sprintf("<tr><td><code>%s</code></td></tr>", $description) : ' ';
+    print { $page_fh } <<_;
+<table align='center'>
+<tr><th>${caption}</th></tr>
+<tr><td><img src='${img_filename}' alt='${caption}' /></td></tr>
+${description}
+</table>
+<br />
+_
+}
+
+sub open_html_page
+{
+    my $filename = $_[0];
+    my $fh;
+    open($fh, sprintf(">%s/%s.html", $report_path, $filename));
+    print { $fh } <<_;
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" 
+   "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en">
+<head>
+    <style type='text/css'>
+	body { text-align: center; }
+	table, td, tr { border-width: 1px; border-style: solid; }
+	th { background-color: lightgray; }
+    </style>
+    <title>Filesystem test results graphs</title>
+</head>
+<body>
+_
+    return $fh;
+}
+
+sub close_html_page
+{
+    my $fh = $_[0];
+    print { $fh } '</body></html>';
+    close($fh);
+}
+
+sub draw
+{
+    my ($img_type, $filename_part, $title, $x_title, $y_title, $headers, $data) = @_[0..6];
+    my $img_filename = sprintf("%s_%s_%s.png", $filename_part, $x_title, $y_title);
+    print(".");
+    #syswrite(STDOUT, ".", 1);
+    my $items = scalar(@$data);
+    if(ref($headers) ne "ARRAY") { my $n = $headers; $headers = []; for(my $i=1; $i<=$items; $i++) { push(@$headers, "${n} ${i}"); } }
+#    my $colors;
+#    foreach my $clr (split(/:/,`$gg -s=00FF00 -e=0000FF -S=$items -t=rcw -S=$items -l`))
+#    {
+#	push(@$colors, add_colour('#'.$clr));
+#    }
+    #print Dumper $colors;
+    my $graph;
+    if($img_type eq 'hbars')
+    {
+	$graph = GD::Graph::bars->new(800, 100+($items*30));
+    	$graph->set	(
+		    y_label     => $y_title,
+		    x_label     => $x_title,
+		    title	=> $title,
+#		    dclrs	=> $colors,
+		    dclrs	=> ['dbrown'],
+		    #bar_width => 5,
+		    bar_spacing => 2,
+		    long_ticks => 0,
+		    show_values => 1,
+		    rotate_chart => 1
+		) or die $graph->error;
+    }
+    elsif($img_type eq 'lines')
+    {
+	$graph = GD::Graph::lines->new(400, 300);
+	$graph->set	(
+		    y_label     => $y_title,
+		    x_label     => $x_title,
+		    title	=> $title,
+		    dclrs	=> ['dbrown'],
+		    show_values => 1,
+		    line_width	=> 3
+		) or die $graph->error;
+    }
+    #$graph->set_title_font('gdMediumBoldFont', 18);
+    #$graph->set_legend_font('gdMediumBoldFont');
+    #$graph->set_legend_font( ['verdana', 'arial', 'gdMediumBoldFont'], 12);
+    #$graph->set_legend(@$headers);
+    my @arr = ($headers, $data);
+    my $img = $graph->plot(\@arr) or die $graph->error;
+    
+    my $ih; 
+    open($ih, sprintf(">%s/%s", $report_path, $img_filename)) or die $!;
+    binmode($ih);
+    print { $ih } $img->png;
+    close($ih);
+    return $img_filename;
+}
+
+main();
+
+#prepare_fileset();
+#remove_fileset();
+
+#$bench_data = {'1' => {'time' => {'tmpfs' => {'copy_4_16777216' => {'caption' => ['Copying 4 files, 16777216 bytes per file'],'data' => ['0.166459'],'command' => ['cp /mnt/tmpfs/16777216/* /mnt/tmp/a']},'remove_1000_12288' => {'caption' => ['Removing 1000 files, 12288 bytes per file'],'data' => ['0.023448'],'command' => ['rm -f /mnt/tmp/b/*']},'copy_1_67108864' => {'caption' => ['Copying 1 files, 67108864 bytes per file'],'data' => ['0.166755'],'command' => ['cp /mnt/tmpfs/67108864/* /mnt/tmp/a']},'move_1_67108864' => {'caption' => ['Moving 1 files, 67108864 bytes per file'],'data' => ['0.018173'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'remove_4_16777216' => {'caption' => ['Removing 4 files, 16777216 bytes per file'],'data' => ['0.016742'],'command' => ['rm -f /mnt/tmp/b/*']},'move_4_16777216' => {'caption' => ['Moving 4 files, 16777216 bytes per file'],'data' => ['0.016642'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'remove_64_1048576' => {'caption' => ['Removing 64 files, 1048576 bytes per file'],'data' => ['0.017823'],'command' => ['rm -f /mnt/tmp/b/*']},'move_64_1048576' => {'caption' => ['Moving 64 files, 1048576 bytes per file'],'data' => ['0.009865'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'remove_8_8388608' => {'caption' => ['Removing 8 files, 8388608 bytes per file'],'data' => ['0.015569'],'command' => ['rm -f /mnt/tmp/b/*']},'mount' => {'caption' => ['tmpfs mount time'],'data' => ['0.008914'],'command' => ['mount -t tmpfs tmpfs /mnt/tmp']},'copy_1000_12288' => {'caption' => ['Copying 1000 files, 12288 bytes per file'],'data' => ['0.080584'],'command' => ['cp /mnt/tmpfs/12288/* /mnt/tmp/a']},'umount' => {'caption' => ['tmpfs unmount time'],'data' => ['0.013168'],'command' => ['umount /mnt/tmp']},'format' => {'caption' => ['tmpfs formatting time'],'data' => ['0.005895'],'command' => ['true']},'copy_64_1048576' => {'caption' => ['Copying 64 files, 1048576 bytes per file'],'data' => ['0.175518'],'command' => ['cp /mnt/tmpfs/1048576/* /mnt/tmp/a']},'remove_1_67108864' => {'caption' => ['Removing 1 files, 67108864 bytes per file'],'data' => ['0.018049'],'command' => ['rm -f /mnt/tmp/b/*']},'move_1000_12288' => {'caption' => ['Moving 1000 files, 12288 bytes per file'],'data' => ['0.029762'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'mkdir' => {'caption' => ['tmpfs make directory time','tmpfs make directory time'],'data' => ['0.016914','0.018823'],'command' => ['mkdir -p /mnt/tmp/a','mkdir -p /mnt/tmp/b']},'move_8_8388608' => {'caption' => ['Moving 8 files, 8388608 bytes per file'],'data' => ['0.018593'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'copy_8_8388608' => {'caption' => ['Copying 8 files, 8388608 bytes per file'],'data' => ['0.168012'],'command' => ['cp /mnt/tmpfs/8388608/* /mnt/tmp/a']}},'ext3' => {'copy_4_16777216' => {'caption' => ['Copying 4 files, 16777216 bytes per file'],'data' => ['0.971635'],'command' => ['cp /mnt/tmpfs/16777216/* /mnt/tmp/a']},'remove_1000_12288' => {'caption' => ['Removing 1000 files, 12288 bytes per file'],'data' => ['0.054907'],'command' => ['rm -f /mnt/tmp/b/*']},'copy_1_67108864' => {'caption' => ['Copying 1 files, 67108864 bytes per file'],'data' => ['0.833739'],'command' => ['cp /mnt/tmpfs/67108864/* /mnt/tmp/a']},'move_1_67108864' => {'caption' => ['Moving 1 files, 67108864 bytes per file'],'data' => ['0.00809'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'remove_4_16777216' => {'caption' => ['Removing 4 files, 16777216 bytes per file'],'data' => ['0.068185'],'command' => ['rm -f /mnt/tmp/b/*']},'move_4_16777216' => {'caption' => ['Moving 4 files, 16777216 bytes per file'],'data' => ['0.018064'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'remove_64_1048576' => {'caption' => ['Removing 64 files, 1048576 bytes per file'],'data' => ['0.071893'],'command' => ['rm -f /mnt/tmp/b/*']},'move_64_1048576' => {'caption' => ['Moving 64 files, 1048576 bytes per file'],'data' => ['0.012375'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'remove_8_8388608' => {'caption' => ['Removing 8 files, 8388608 bytes per file'],'data' => ['0.069698'],'command' => ['rm -f /mnt/tmp/b/*']},'mount' => {'caption' => ['ext3 mount time'],'data' => ['0.020646'],'command' => ['mount -t ext3 -o loop /mnt/tmpvd/disk.img /mnt/tmp']},'copy_1000_12288' => {'caption' => ['Copying 1000 files, 12288 bytes per file'],'data' => ['0.256713'],'command' => ['cp /mnt/tmpfs/12288/* /mnt/tmp/a']},'umount' => {'caption' => ['ext3 unmount time'],'data' => ['0.013829'],'command' => ['umount /mnt/tmp']},'format' => {'caption' => ['ext3 formatting time'],'data' => ['0.03283'],'command' => ['mkfs -t ext3 -F /mnt/tmpvd/disk.img']},'copy_64_1048576' => {'caption' => ['Copying 64 files, 1048576 bytes per file'],'data' => ['0.856094'],'command' => ['cp /mnt/tmpfs/1048576/* /mnt/tmp/a']},'remove_1_67108864' => {'caption' => ['Removing 1 files, 67108864 bytes per file'],'data' => ['0.069765'],'command' => ['rm -f /mnt/tmp/b/*']},'move_1000_12288' => {'caption' => ['Moving 1000 files, 12288 bytes per file'],'data' => ['0.051627'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'mkdir' => {'caption' => ['ext3 make directory time','ext3 make directory time'],'data' => ['0.014322','0.007892'],'command' => ['mkdir -p /mnt/tmp/a','mkdir -p /mnt/tmp/b']},'move_8_8388608' => {'caption' => ['Moving 8 files, 8388608 bytes per file'],'data' => ['0.015019'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'copy_8_8388608' => {'caption' => ['Copying 8 files, 8388608 bytes per file'],'data' => ['0.924425'],'command' => ['cp /mnt/tmpfs/8388608/* /mnt/tmp/a']}}},'size' => {'tmpfs' => {'aremove_8_8388608' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [3],'bavail' => [1054994432],'user_favail' => [257564],'caption' => 'After removing 8 files, 8388608 bytes per file','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257564],'per' => [0],'favail' => [257564],'fused' => [3],'su_blocks' => [1054994432],'ffree' => [257564],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'aremove_1_67108864' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [3],'bavail' => [1054994432],'user_favail' => [257564],'caption' => 'After removing 1 files, 67108864 bytes per file','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257564],'per' => [0],'favail' => [257564],'fused' => [3],'su_blocks' => [1054994432],'ffree' => [257564],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'aformat' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [1],'bavail' => [1054994432],'user_favail' => [257566],'caption' => 'After tmpfs format','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257566],'per' => [0],'favail' => [257566],'fused' => [1],'su_blocks' => [1054994432],'ffree' => [257566],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'amove_4_16777216' => {'bfree' => [987738112],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [7],'bavail' => [987738112],'user_favail' => [257560],'caption' => 'After moving 4 files, 16777216 bytes per file','su_bavail' => [987738112],'fper' => [0],'su_favail' => [257560],'per' => [6],'favail' => [257560],'fused' => [7],'su_blocks' => [1054994432],'ffree' => [257560],'user_blocks' => [1054994432],'used' => [67256320],'su_files' => [257567],'user_bavail' => [987738112],'user_used' => [67256320]},'amove_1_67108864' => {'bfree' => [987750400],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [4],'bavail' => [987750400],'user_favail' => [257563],'caption' => 'After moving 1 files, 67108864 bytes per file','su_bavail' => [987750400],'fper' => [0],'su_favail' => [257563],'per' => [6],'favail' => [257563],'fused' => [4],'su_blocks' => [1054994432],'ffree' => [257563],'user_blocks' => [1054994432],'used' => [67244032],'su_files' => [257567],'user_bavail' => [987750400],'user_used' => [67244032]},'amove_8_8388608' => {'bfree' => [987721728],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [11],'bavail' => [987721728],'user_favail' => [257556],'caption' => 'After moving 8 files, 8388608 bytes per file','su_bavail' => [987721728],'fper' => [0],'su_favail' => [257556],'per' => [6],'favail' => [257556],'fused' => [11],'su_blocks' => [1054994432],'ffree' => [257556],'user_blocks' => [1054994432],'used' => [67272704],'su_files' => [257567],'user_bavail' => [987721728],'user_used' => [67272704]},'acopy_8_8388608' => {'bfree' => [987721728],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [11],'bavail' => [987721728],'user_favail' => [257556],'caption' => 'After copying 8 files, 8388608 bytes per file','su_bavail' => [987721728],'fper' => [0],'su_favail' => [257556],'per' => [6],'favail' => [257556],'fused' => [11],'su_blocks' => [1054994432],'ffree' => [257556],'user_blocks' => [1054994432],'used' => [67272704],'su_files' => [257567],'user_bavail' => [987721728],'user_used' => [67272704]},'aremove_4_16777216' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [3],'bavail' => [1054994432],'user_favail' => [257564],'caption' => 'After removing 4 files, 16777216 bytes per file','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257564],'per' => [0],'favail' => [257564],'fused' => [3],'su_blocks' => [1054994432],'ffree' => [257564],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'acopy_1_67108864' => {'bfree' => [987750400],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [4],'bavail' => [987750400],'user_favail' => [257563],'caption' => 'After copying 1 files, 67108864 bytes per file','su_bavail' => [987750400],'fper' => [0],'su_favail' => [257563],'per' => [6],'favail' => [257563],'fused' => [4],'su_blocks' => [1054994432],'ffree' => [257563],'user_blocks' => [1054994432],'used' => [67244032],'su_files' => [257567],'user_bavail' => [987750400],'user_used' => [67244032]},'aremove_64_1048576' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [3],'bavail' => [1054994432],'user_favail' => [257564],'caption' => 'After removing 64 files, 1048576 bytes per file','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257564],'per' => [0],'favail' => [257564],'fused' => [3],'su_blocks' => [1054994432],'ffree' => [257564],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'acopy_64_1048576' => {'bfree' => [987361280],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [67],'bavail' => [987361280],'user_favail' => [257500],'caption' => 'After copying 64 files, 1048576 bytes per file','su_bavail' => [987361280],'fper' => [0],'su_favail' => [257500],'per' => [6],'favail' => [257500],'fused' => [67],'su_blocks' => [1054994432],'ffree' => [257500],'user_blocks' => [1054994432],'used' => [67633152],'su_files' => [257567],'user_bavail' => [987361280],'user_used' => [67633152]},'amove_64_1048576' => {'bfree' => [987361280],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [67],'bavail' => [987361280],'user_favail' => [257500],'caption' => 'After moving 64 files, 1048576 bytes per file','su_bavail' => [987361280],'fper' => [0],'su_favail' => [257500],'per' => [6],'favail' => [257500],'fused' => [67],'su_blocks' => [1054994432],'ffree' => [257500],'user_blocks' => [1054994432],'used' => [67633152],'su_files' => [257567],'user_bavail' => [987361280],'user_used' => [67633152]},'amove_1000_12288' => {'bfree' => [1042706432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [1003],'bavail' => [1042706432],'user_favail' => [256564],'caption' => 'After moving 1000 files, 12288 bytes per file','su_bavail' => [1042706432],'fper' => [0],'su_favail' => [256564],'per' => [1],'favail' => [256564],'fused' => [1003],'su_blocks' => [1054994432],'ffree' => [256564],'user_blocks' => [1054994432],'used' => [12288000],'su_files' => [257567],'user_bavail' => [1042706432],'user_used' => [12288000]},'acopy_4_16777216' => {'bfree' => [987738112],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [7],'bavail' => [987738112],'user_favail' => [257560],'caption' => 'After copying 4 files, 16777216 bytes per file','su_bavail' => [987738112],'fper' => [0],'su_favail' => [257560],'per' => [6],'favail' => [257560],'fused' => [7],'su_blocks' => [1054994432],'ffree' => [257560],'user_blocks' => [1054994432],'used' => [67256320],'su_files' => [257567],'user_bavail' => [987738112],'user_used' => [67256320]},'aremove_1000_12288' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [3],'bavail' => [1054994432],'user_favail' => [257564],'caption' => 'After removing 1000 files, 12288 bytes per file','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257564],'per' => [0],'favail' => [257564],'fused' => [3],'su_blocks' => [1054994432],'ffree' => [257564],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'amkdir' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [3],'bavail' => [1054994432],'user_favail' => [257564],'caption' => 'After makin directoryes on tmpfs','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257564],'per' => [0],'favail' => [257564],'fused' => [3],'su_blocks' => [1054994432],'ffree' => [257564],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'acopy_1000_12288' => {'bfree' => [1042706432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [1003],'bavail' => [1042706432],'user_favail' => [256564],'caption' => 'After copying 1000 files, 12288 bytes per file','su_bavail' => [1042706432],'fper' => [0],'su_favail' => [256564],'per' => [1],'favail' => [256564],'fused' => [1003],'su_blocks' => [1054994432],'ffree' => [256564],'user_blocks' => [1054994432],'used' => [12288000],'su_files' => [257567],'user_bavail' => [1042706432],'user_used' => [12288000]}},'ext3' => {'aremove_8_8388608' => {'bfree' => [78630912],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [13],'bavail' => [74269696],'user_favail' => [21371],'caption' => 'After removing 8 files, 8388608 bytes per file','su_bavail' => [78630912],'fper' => [0],'su_favail' => [21371],'per' => [7],'favail' => [21371],'fused' => [13],'su_blocks' => [84467712],'ffree' => [21371],'user_blocks' => [80106496],'used' => [5836800],'su_files' => [21384],'user_bavail' => [74269696],'user_used' => [5836800]},'aremove_1_67108864' => {'bfree' => [78630912],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [13],'bavail' => [74269696],'user_favail' => [21371],'caption' => 'After removing 1 files, 67108864 bytes per file','su_bavail' => [78630912],'fper' => [0],'su_favail' => [21371],'per' => [7],'favail' => [21371],'fused' => [13],'su_blocks' => [84467712],'ffree' => [21371],'user_blocks' => [80106496],'used' => [5836800],'su_files' => [21384],'user_bavail' => [74269696],'user_used' => [5836800]},'aformat' => {'bfree' => [78667776],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [11],'bavail' => [74306560],'user_favail' => [21373],'caption' => 'After ext3 format','su_bavail' => [78667776],'fper' => [0],'su_favail' => [21373],'per' => [7],'favail' => [21373],'fused' => [11],'su_blocks' => [84467712],'ffree' => [21373],'user_blocks' => [80106496],'used' => [5799936],'su_files' => [21384],'user_bavail' => [74306560],'user_used' => [5799936]},'amove_4_16777216' => {'bfree' => [11255808],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [17],'bavail' => [6894592],'user_favail' => [21367],'caption' => 'After moving 4 files, 16777216 bytes per file','su_bavail' => [11255808],'fper' => [0],'su_favail' => [21367],'per' => [91],'favail' => [21367],'fused' => [17],'su_blocks' => [84467712],'ffree' => [21367],'user_blocks' => [80106496],'used' => [73211904],'su_files' => [21384],'user_bavail' => [6894592],'user_used' => [73211904]},'amove_1_67108864' => {'bfree' => [11258880],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [14],'bavail' => [6897664],'user_favail' => [21370],'caption' => 'After moving 1 files, 67108864 bytes per file','su_bavail' => [11258880],'fper' => [0],'su_favail' => [21370],'per' => [91],'favail' => [21370],'fused' => [14],'su_blocks' => [84467712],'ffree' => [21370],'user_blocks' => [80106496],'used' => [73208832],'su_files' => [21384],'user_bavail' => [6897664],'user_used' => [73208832]},'amove_8_8388608' => {'bfree' => [11251712],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [21],'bavail' => [6890496],'user_favail' => [21363],'caption' => 'After moving 8 files, 8388608 bytes per file','su_bavail' => [11251712],'fper' => [0],'su_favail' => [21363],'per' => [91],'favail' => [21363],'fused' => [21],'su_blocks' => [84467712],'ffree' => [21363],'user_blocks' => [80106496],'used' => [73216000],'su_files' => [21384],'user_bavail' => [6890496],'user_used' => [73216000]},'acopy_8_8388608' => {'bfree' => [11251712],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [21],'bavail' => [6890496],'user_favail' => [21363],'caption' => 'After copying 8 files, 8388608 bytes per file','su_bavail' => [11251712],'fper' => [0],'su_favail' => [21363],'per' => [91],'favail' => [21363],'fused' => [21],'su_blocks' => [84467712],'ffree' => [21363],'user_blocks' => [80106496],'used' => [73216000],'su_files' => [21384],'user_bavail' => [6890496],'user_used' => [73216000]},'aremove_4_16777216' => {'bfree' => [78630912],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [13],'bavail' => [74269696],'user_favail' => [21371],'caption' => 'After removing 4 files, 16777216 bytes per file','su_bavail' => [78630912],'fper' => [0],'su_favail' => [21371],'per' => [7],'favail' => [21371],'fused' => [13],'su_blocks' => [84467712],'ffree' => [21371],'user_blocks' => [80106496],'used' => [5836800],'su_files' => [21384],'user_bavail' => [74269696],'user_used' => [5836800]},'acopy_1_67108864' => {'bfree' => [11258880],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [14],'bavail' => [6897664],'user_favail' => [21370],'caption' => 'After copying 1 files, 67108864 bytes per file','su_bavail' => [11258880],'fper' => [0],'su_favail' => [21370],'per' => [91],'favail' => [21370],'fused' => [14],'su_blocks' => [84467712],'ffree' => [21370],'user_blocks' => [80106496],'used' => [73208832],'su_files' => [21384],'user_bavail' => [6897664],'user_used' => [73208832]},'aremove_64_1048576' => {'bfree' => [78665728],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [13],'bavail' => [74304512],'user_favail' => [21371],'caption' => 'After removing 64 files, 1048576 bytes per file','su_bavail' => [78665728],'fper' => [0],'su_favail' => [21371],'per' => [7],'favail' => [21371],'fused' => [13],'su_blocks' => [84467712],'ffree' => [21371],'user_blocks' => [80106496],'used' => [5801984],'su_files' => [21384],'user_bavail' => [74304512],'user_used' => [5801984]},'acopy_64_1048576' => {'bfree' => [11229184],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [77],'bavail' => [6867968],'user_favail' => [21307],'caption' => 'After copying 64 files, 1048576 bytes per file','su_bavail' => [11229184],'fper' => [0],'su_favail' => [21307],'per' => [91],'favail' => [21307],'fused' => [77],'su_blocks' => [84467712],'ffree' => [21307],'user_blocks' => [80106496],'used' => [73238528],'su_files' => [21384],'user_bavail' => [6867968],'user_used' => [73238528]},'amove_64_1048576' => {'bfree' => [11229184],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [77],'bavail' => [6867968],'user_favail' => [21307],'caption' => 'After moving 64 files, 1048576 bytes per file','su_bavail' => [11229184],'fper' => [0],'su_favail' => [21307],'per' => [91],'favail' => [21307],'fused' => [77],'su_blocks' => [84467712],'ffree' => [21307],'user_blocks' => [80106496],'used' => [73238528],'su_files' => [21384],'user_bavail' => [6867968],'user_used' => [73238528]},'amove_1000_12288' => {'bfree' => [66342912],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [1013],'bavail' => [61981696],'user_favail' => [20371],'caption' => 'After moving 1000 files, 12288 bytes per file','su_bavail' => [66342912],'fper' => [5],'su_favail' => [20371],'per' => [23],'favail' => [20371],'fused' => [1013],'su_blocks' => [84467712],'ffree' => [20371],'user_blocks' => [80106496],'used' => [18124800],'su_files' => [21384],'user_bavail' => [61981696],'user_used' => [18124800]},'acopy_4_16777216' => {'bfree' => [11255808],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [17],'bavail' => [6894592],'user_favail' => [21367],'caption' => 'After copying 4 files, 16777216 bytes per file','su_bavail' => [11255808],'fper' => [0],'su_favail' => [21367],'per' => [91],'favail' => [21367],'fused' => [17],'su_blocks' => [84467712],'ffree' => [21367],'user_blocks' => [80106496],'used' => [73211904],'su_files' => [21384],'user_bavail' => [6894592],'user_used' => [73211904]},'aremove_1000_12288' => {'bfree' => [78630912],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [13],'bavail' => [74269696],'user_favail' => [21371],'caption' => 'After removing 1000 files, 12288 bytes per file','su_bavail' => [78630912],'fper' => [0],'su_favail' => [21371],'per' => [7],'favail' => [21371],'fused' => [13],'su_blocks' => [84467712],'ffree' => [21371],'user_blocks' => [80106496],'used' => [5836800],'su_files' => [21384],'user_bavail' => [74269696],'user_used' => [5836800]},'amkdir' => {'bfree' => [78665728],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [13],'bavail' => [74304512],'user_favail' => [21371],'caption' => 'After makin directoryes on ext3','su_bavail' => [78665728],'fper' => [0],'su_favail' => [21371],'per' => [7],'favail' => [21371],'fused' => [13],'su_blocks' => [84467712],'ffree' => [21371],'user_blocks' => [80106496],'used' => [5801984],'su_files' => [21384],'user_bavail' => [74304512],'user_used' => [5801984]},'acopy_1000_12288' => {'bfree' => [66360320],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [1013],'bavail' => [61999104],'user_favail' => [20371],'caption' => 'After copying 1000 files, 12288 bytes per file','su_bavail' => [66360320],'fper' => [5],'su_favail' => [20371],'per' => [23],'favail' => [20371],'fused' => [1013],'su_blocks' => [84467712],'ffree' => [20371],'user_blocks' => [80106496],'used' => [18107392],'su_files' => [21384],'user_bavail' => [61999104],'user_used' => [18107392]}}}},'0' => {'time' => {'tmpfs' => {'copy_4_16777216' => {'caption' => ['Copying 4 files, 16777216 bytes per file'],'data' => ['0.174011'],'command' => ['cp /mnt/tmpfs/16777216/* /mnt/tmp/a']},'remove_1000_12288' => {'caption' => ['Removing 1000 files, 12288 bytes per file'],'data' => ['0.036547'],'command' => ['rm -f /mnt/tmp/b/*']},'copy_1_67108864' => {'caption' => ['Copying 1 files, 67108864 bytes per file'],'data' => ['0.164679'],'command' => ['cp /mnt/tmpfs/67108864/* /mnt/tmp/a']},'move_1_67108864' => {'caption' => ['Moving 1 files, 67108864 bytes per file'],'data' => ['0.017769'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'remove_4_16777216' => {'caption' => ['Removing 4 files, 16777216 bytes per file'],'data' => ['0.019637'],'command' => ['rm -f /mnt/tmp/b/*']},'move_4_16777216' => {'caption' => ['Moving 4 files, 16777216 bytes per file'],'data' => ['0.00861'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'remove_64_1048576' => {'caption' => ['Removing 64 files, 1048576 bytes per file'],'data' => ['0.020653'],'command' => ['rm -f /mnt/tmp/b/*']},'move_64_1048576' => {'caption' => ['Moving 64 files, 1048576 bytes per file'],'data' => ['0.028924'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'remove_8_8388608' => {'caption' => ['Removing 8 files, 8388608 bytes per file'],'data' => ['0.022095'],'command' => ['rm -f /mnt/tmp/b/*']},'mount' => {'caption' => ['tmpfs mount time'],'data' => ['0.018565'],'command' => ['mount -t tmpfs tmpfs /mnt/tmp']},'copy_1000_12288' => {'caption' => ['Copying 1000 files, 12288 bytes per file'],'data' => ['0.093618'],'command' => ['cp /mnt/tmpfs/12288/* /mnt/tmp/a']},'umount' => {'caption' => ['tmpfs unmount time'],'data' => ['0.013487'],'command' => ['umount /mnt/tmp']},'format' => {'caption' => ['tmpfs formatting time'],'data' => ['0.025883'],'command' => ['true']},'copy_64_1048576' => {'caption' => ['Copying 64 files, 1048576 bytes per file'],'data' => ['0.172443'],'command' => ['cp /mnt/tmpfs/1048576/* /mnt/tmp/a']},'remove_1_67108864' => {'caption' => ['Removing 1 files, 67108864 bytes per file'],'data' => ['0.017511'],'command' => ['rm -f /mnt/tmp/b/*']},'move_1000_12288' => {'caption' => ['Moving 1000 files, 12288 bytes per file'],'data' => ['0.044139'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'mkdir' => {'caption' => ['tmpfs make directory time','tmpfs make directory time'],'data' => ['0.009839','0.020531'],'command' => ['mkdir -p /mnt/tmp/a','mkdir -p /mnt/tmp/b']},'move_8_8388608' => {'caption' => ['Moving 8 files, 8388608 bytes per file'],'data' => ['0.007488'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'copy_8_8388608' => {'caption' => ['Copying 8 files, 8388608 bytes per file'],'data' => ['0.1727'],'command' => ['cp /mnt/tmpfs/8388608/* /mnt/tmp/a']}},'ext3' => {'copy_4_16777216' => {'caption' => ['Copying 4 files, 16777216 bytes per file'],'data' => ['0.95759'],'command' => ['cp /mnt/tmpfs/16777216/* /mnt/tmp/a']},'remove_1000_12288' => {'caption' => ['Removing 1000 files, 12288 bytes per file'],'data' => ['0.066507'],'command' => ['rm -f /mnt/tmp/b/*']},'copy_1_67108864' => {'caption' => ['Copying 1 files, 67108864 bytes per file'],'data' => ['0.969957'],'command' => ['cp /mnt/tmpfs/67108864/* /mnt/tmp/a']},'move_1_67108864' => {'caption' => ['Moving 1 files, 67108864 bytes per file'],'data' => ['0.007487'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'remove_4_16777216' => {'caption' => ['Removing 4 files, 16777216 bytes per file'],'data' => ['0.095424'],'command' => ['rm -f /mnt/tmp/b/*']},'move_4_16777216' => {'caption' => ['Moving 4 files, 16777216 bytes per file'],'data' => ['0.008084'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'remove_64_1048576' => {'caption' => ['Removing 64 files, 1048576 bytes per file'],'data' => ['0.068204'],'command' => ['rm -f /mnt/tmp/b/*']},'move_64_1048576' => {'caption' => ['Moving 64 files, 1048576 bytes per file'],'data' => ['0.030617'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'remove_8_8388608' => {'caption' => ['Removing 8 files, 8388608 bytes per file'],'data' => ['0.065305'],'command' => ['rm -f /mnt/tmp/b/*']},'mount' => {'caption' => ['ext3 mount time'],'data' => ['0.025716'],'command' => ['mount -t ext3 -o loop /mnt/tmpvd/disk.img /mnt/tmp']},'copy_1000_12288' => {'caption' => ['Copying 1000 files, 12288 bytes per file'],'data' => ['0.234782'],'command' => ['cp /mnt/tmpfs/12288/* /mnt/tmp/a']},'umount' => {'caption' => ['ext3 unmount time'],'data' => ['0.024806'],'command' => ['umount /mnt/tmp']},'format' => {'caption' => ['ext3 formatting time'],'data' => ['0.058755'],'command' => ['mkfs -t ext3 -F /mnt/tmpvd/disk.img']},'copy_64_1048576' => {'caption' => ['Copying 64 files, 1048576 bytes per file'],'data' => ['0.974733'],'command' => ['cp /mnt/tmpfs/1048576/* /mnt/tmp/a']},'remove_1_67108864' => {'caption' => ['Removing 1 files, 67108864 bytes per file'],'data' => ['0.071978'],'command' => ['rm -f /mnt/tmp/b/*']},'move_1000_12288' => {'caption' => ['Moving 1000 files, 12288 bytes per file'],'data' => ['0.118256'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'mkdir' => {'caption' => ['ext3 make directory time','ext3 make directory time'],'data' => ['0.042227','0.023432'],'command' => ['mkdir -p /mnt/tmp/a','mkdir -p /mnt/tmp/b']},'move_8_8388608' => {'caption' => ['Moving 8 files, 8388608 bytes per file'],'data' => ['0.032949'],'command' => ['mv -f /mnt/tmp/a/* /mnt/tmp/b']},'copy_8_8388608' => {'caption' => ['Copying 8 files, 8388608 bytes per file'],'data' => ['1.085223'],'command' => ['cp /mnt/tmpfs/8388608/* /mnt/tmp/a']}}},'size' => {'tmpfs' => {'aremove_8_8388608' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [3],'bavail' => [1054994432],'user_favail' => [257564],'caption' => 'After removing 8 files, 8388608 bytes per file','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257564],'per' => [0],'favail' => [257564],'fused' => [3],'su_blocks' => [1054994432],'ffree' => [257564],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'aremove_1_67108864' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [3],'bavail' => [1054994432],'user_favail' => [257564],'caption' => 'After removing 1 files, 67108864 bytes per file','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257564],'per' => [0],'favail' => [257564],'fused' => [3],'su_blocks' => [1054994432],'ffree' => [257564],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'aformat' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [1],'bavail' => [1054994432],'user_favail' => [257566],'caption' => 'After tmpfs format','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257566],'per' => [0],'favail' => [257566],'fused' => [1],'su_blocks' => [1054994432],'ffree' => [257566],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'amove_4_16777216' => {'bfree' => [987738112],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [7],'bavail' => [987738112],'user_favail' => [257560],'caption' => 'After moving 4 files, 16777216 bytes per file','su_bavail' => [987738112],'fper' => [0],'su_favail' => [257560],'per' => [6],'favail' => [257560],'fused' => [7],'su_blocks' => [1054994432],'ffree' => [257560],'user_blocks' => [1054994432],'used' => [67256320],'su_files' => [257567],'user_bavail' => [987738112],'user_used' => [67256320]},'amove_1_67108864' => {'bfree' => [987750400],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [4],'bavail' => [987750400],'user_favail' => [257563],'caption' => 'After moving 1 files, 67108864 bytes per file','su_bavail' => [987750400],'fper' => [0],'su_favail' => [257563],'per' => [6],'favail' => [257563],'fused' => [4],'su_blocks' => [1054994432],'ffree' => [257563],'user_blocks' => [1054994432],'used' => [67244032],'su_files' => [257567],'user_bavail' => [987750400],'user_used' => [67244032]},'amove_8_8388608' => {'bfree' => [987721728],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [11],'bavail' => [987721728],'user_favail' => [257556],'caption' => 'After moving 8 files, 8388608 bytes per file','su_bavail' => [987721728],'fper' => [0],'su_favail' => [257556],'per' => [6],'favail' => [257556],'fused' => [11],'su_blocks' => [1054994432],'ffree' => [257556],'user_blocks' => [1054994432],'used' => [67272704],'su_files' => [257567],'user_bavail' => [987721728],'user_used' => [67272704]},'acopy_8_8388608' => {'bfree' => [987721728],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [11],'bavail' => [987721728],'user_favail' => [257556],'caption' => 'After copying 8 files, 8388608 bytes per file','su_bavail' => [987721728],'fper' => [0],'su_favail' => [257556],'per' => [6],'favail' => [257556],'fused' => [11],'su_blocks' => [1054994432],'ffree' => [257556],'user_blocks' => [1054994432],'used' => [67272704],'su_files' => [257567],'user_bavail' => [987721728],'user_used' => [67272704]},'aremove_4_16777216' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [3],'bavail' => [1054994432],'user_favail' => [257564],'caption' => 'After removing 4 files, 16777216 bytes per file','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257564],'per' => [0],'favail' => [257564],'fused' => [3],'su_blocks' => [1054994432],'ffree' => [257564],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'acopy_1_67108864' => {'bfree' => [987750400],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [4],'bavail' => [987750400],'user_favail' => [257563],'caption' => 'After copying 1 files, 67108864 bytes per file','su_bavail' => [987750400],'fper' => [0],'su_favail' => [257563],'per' => [6],'favail' => [257563],'fused' => [4],'su_blocks' => [1054994432],'ffree' => [257563],'user_blocks' => [1054994432],'used' => [67244032],'su_files' => [257567],'user_bavail' => [987750400],'user_used' => [67244032]},'aremove_64_1048576' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [3],'bavail' => [1054994432],'user_favail' => [257564],'caption' => 'After removing 64 files, 1048576 bytes per file','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257564],'per' => [0],'favail' => [257564],'fused' => [3],'su_blocks' => [1054994432],'ffree' => [257564],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'acopy_64_1048576' => {'bfree' => [987361280],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [67],'bavail' => [987361280],'user_favail' => [257500],'caption' => 'After copying 64 files, 1048576 bytes per file','su_bavail' => [987361280],'fper' => [0],'su_favail' => [257500],'per' => [6],'favail' => [257500],'fused' => [67],'su_blocks' => [1054994432],'ffree' => [257500],'user_blocks' => [1054994432],'used' => [67633152],'su_files' => [257567],'user_bavail' => [987361280],'user_used' => [67633152]},'amove_64_1048576' => {'bfree' => [987361280],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [67],'bavail' => [987361280],'user_favail' => [257500],'caption' => 'After moving 64 files, 1048576 bytes per file','su_bavail' => [987361280],'fper' => [0],'su_favail' => [257500],'per' => [6],'favail' => [257500],'fused' => [67],'su_blocks' => [1054994432],'ffree' => [257500],'user_blocks' => [1054994432],'used' => [67633152],'su_files' => [257567],'user_bavail' => [987361280],'user_used' => [67633152]},'amove_1000_12288' => {'bfree' => [1042706432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [1003],'bavail' => [1042706432],'user_favail' => [256564],'caption' => 'After moving 1000 files, 12288 bytes per file','su_bavail' => [1042706432],'fper' => [0],'su_favail' => [256564],'per' => [1],'favail' => [256564],'fused' => [1003],'su_blocks' => [1054994432],'ffree' => [256564],'user_blocks' => [1054994432],'used' => [12288000],'su_files' => [257567],'user_bavail' => [1042706432],'user_used' => [12288000]},'acopy_4_16777216' => {'bfree' => [987738112],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [7],'bavail' => [987738112],'user_favail' => [257560],'caption' => 'After copying 4 files, 16777216 bytes per file','su_bavail' => [987738112],'fper' => [0],'su_favail' => [257560],'per' => [6],'favail' => [257560],'fused' => [7],'su_blocks' => [1054994432],'ffree' => [257560],'user_blocks' => [1054994432],'used' => [67256320],'su_files' => [257567],'user_bavail' => [987738112],'user_used' => [67256320]},'aremove_1000_12288' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [3],'bavail' => [1054994432],'user_favail' => [257564],'caption' => 'After removing 1000 files, 12288 bytes per file','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257564],'per' => [0],'favail' => [257564],'fused' => [3],'su_blocks' => [1054994432],'ffree' => [257564],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'amkdir' => {'bfree' => [1054994432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [3],'bavail' => [1054994432],'user_favail' => [257564],'caption' => 'After makin directoryes on tmpfs','su_bavail' => [1054994432],'fper' => [0],'su_favail' => [257564],'per' => [0],'favail' => [257564],'fused' => [3],'su_blocks' => [1054994432],'ffree' => [257564],'user_blocks' => [0],'used' => [0],'su_files' => [257567],'user_bavail' => [1054994432],'user_used' => [0]},'acopy_1000_12288' => {'bfree' => [1042706432],'user_files' => [257567],'blocks' => [1054994432],'files' => [257567],'user_fused' => [1003],'bavail' => [1042706432],'user_favail' => [256564],'caption' => 'After copying 1000 files, 12288 bytes per file','su_bavail' => [1042706432],'fper' => [0],'su_favail' => [256564],'per' => [1],'favail' => [256564],'fused' => [1003],'su_blocks' => [1054994432],'ffree' => [256564],'user_blocks' => [1054994432],'used' => [12288000],'su_files' => [257567],'user_bavail' => [1042706432],'user_used' => [12288000]}},'ext3' => {'aremove_8_8388608' => {'bfree' => [78630912],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [13],'bavail' => [74269696],'user_favail' => [21371],'caption' => 'After removing 8 files, 8388608 bytes per file','su_bavail' => [78630912],'fper' => [0],'su_favail' => [21371],'per' => [7],'favail' => [21371],'fused' => [13],'su_blocks' => [84467712],'ffree' => [21371],'user_blocks' => [80106496],'used' => [5836800],'su_files' => [21384],'user_bavail' => [74269696],'user_used' => [5836800]},'aremove_1_67108864' => {'bfree' => [78630912],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [13],'bavail' => [74269696],'user_favail' => [21371],'caption' => 'After removing 1 files, 67108864 bytes per file','su_bavail' => [78630912],'fper' => [0],'su_favail' => [21371],'per' => [7],'favail' => [21371],'fused' => [13],'su_blocks' => [84467712],'ffree' => [21371],'user_blocks' => [80106496],'used' => [5836800],'su_files' => [21384],'user_bavail' => [74269696],'user_used' => [5836800]},'aformat' => {'bfree' => [78667776],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [11],'bavail' => [74306560],'user_favail' => [21373],'caption' => 'After ext3 format','su_bavail' => [78667776],'fper' => [0],'su_favail' => [21373],'per' => [7],'favail' => [21373],'fused' => [11],'su_blocks' => [84467712],'ffree' => [21373],'user_blocks' => [80106496],'used' => [5799936],'su_files' => [21384],'user_bavail' => [74306560],'user_used' => [5799936]},'amove_4_16777216' => {'bfree' => [11255808],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [17],'bavail' => [6894592],'user_favail' => [21367],'caption' => 'After moving 4 files, 16777216 bytes per file','su_bavail' => [11255808],'fper' => [0],'su_favail' => [21367],'per' => [91],'favail' => [21367],'fused' => [17],'su_blocks' => [84467712],'ffree' => [21367],'user_blocks' => [80106496],'used' => [73211904],'su_files' => [21384],'user_bavail' => [6894592],'user_used' => [73211904]},'amove_1_67108864' => {'bfree' => [11258880],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [14],'bavail' => [6897664],'user_favail' => [21370],'caption' => 'After moving 1 files, 67108864 bytes per file','su_bavail' => [11258880],'fper' => [0],'su_favail' => [21370],'per' => [91],'favail' => [21370],'fused' => [14],'su_blocks' => [84467712],'ffree' => [21370],'user_blocks' => [80106496],'used' => [73208832],'su_files' => [21384],'user_bavail' => [6897664],'user_used' => [73208832]},'amove_8_8388608' => {'bfree' => [11251712],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [21],'bavail' => [6890496],'user_favail' => [21363],'caption' => 'After moving 8 files, 8388608 bytes per file','su_bavail' => [11251712],'fper' => [0],'su_favail' => [21363],'per' => [91],'favail' => [21363],'fused' => [21],'su_blocks' => [84467712],'ffree' => [21363],'user_blocks' => [80106496],'used' => [73216000],'su_files' => [21384],'user_bavail' => [6890496],'user_used' => [73216000]},'acopy_8_8388608' => {'bfree' => [11251712],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [21],'bavail' => [6890496],'user_favail' => [21363],'caption' => 'After copying 8 files, 8388608 bytes per file','su_bavail' => [11251712],'fper' => [0],'su_favail' => [21363],'per' => [91],'favail' => [21363],'fused' => [21],'su_blocks' => [84467712],'ffree' => [21363],'user_blocks' => [80106496],'used' => [73216000],'su_files' => [21384],'user_bavail' => [6890496],'user_used' => [73216000]},'aremove_4_16777216' => {'bfree' => [78630912],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [13],'bavail' => [74269696],'user_favail' => [21371],'caption' => 'After removing 4 files, 16777216 bytes per file','su_bavail' => [78630912],'fper' => [0],'su_favail' => [21371],'per' => [7],'favail' => [21371],'fused' => [13],'su_blocks' => [84467712],'ffree' => [21371],'user_blocks' => [80106496],'used' => [5836800],'su_files' => [21384],'user_bavail' => [74269696],'user_used' => [5836800]},'acopy_1_67108864' => {'bfree' => [11258880],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [14],'bavail' => [6897664],'user_favail' => [21370],'caption' => 'After copying 1 files, 67108864 bytes per file','su_bavail' => [11258880],'fper' => [0],'su_favail' => [21370],'per' => [91],'favail' => [21370],'fused' => [14],'su_blocks' => [84467712],'ffree' => [21370],'user_blocks' => [80106496],'used' => [73208832],'su_files' => [21384],'user_bavail' => [6897664],'user_used' => [73208832]},'aremove_64_1048576' => {'bfree' => [78665728],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [13],'bavail' => [74304512],'user_favail' => [21371],'caption' => 'After removing 64 files, 1048576 bytes per file','su_bavail' => [78665728],'fper' => [0],'su_favail' => [21371],'per' => [7],'favail' => [21371],'fused' => [13],'su_blocks' => [84467712],'ffree' => [21371],'user_blocks' => [80106496],'used' => [5801984],'su_files' => [21384],'user_bavail' => [74304512],'user_used' => [5801984]},'acopy_64_1048576' => {'bfree' => [11229184],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [77],'bavail' => [6867968],'user_favail' => [21307],'caption' => 'After copying 64 files, 1048576 bytes per file','su_bavail' => [11229184],'fper' => [0],'su_favail' => [21307],'per' => [91],'favail' => [21307],'fused' => [77],'su_blocks' => [84467712],'ffree' => [21307],'user_blocks' => [80106496],'used' => [73238528],'su_files' => [21384],'user_bavail' => [6867968],'user_used' => [73238528]},'amove_64_1048576' => {'bfree' => [11229184],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [77],'bavail' => [6867968],'user_favail' => [21307],'caption' => 'After moving 64 files, 1048576 bytes per file','su_bavail' => [11229184],'fper' => [0],'su_favail' => [21307],'per' => [91],'favail' => [21307],'fused' => [77],'su_blocks' => [84467712],'ffree' => [21307],'user_blocks' => [80106496],'used' => [73238528],'su_files' => [21384],'user_bavail' => [6867968],'user_used' => [73238528]},'amove_1000_12288' => {'bfree' => [66342912],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [1013],'bavail' => [61981696],'user_favail' => [20371],'caption' => 'After moving 1000 files, 12288 bytes per file','su_bavail' => [66342912],'fper' => [5],'su_favail' => [20371],'per' => [23],'favail' => [20371],'fused' => [1013],'su_blocks' => [84467712],'ffree' => [20371],'user_blocks' => [80106496],'used' => [18124800],'su_files' => [21384],'user_bavail' => [61981696],'user_used' => [18124800]},'acopy_4_16777216' => {'bfree' => [11255808],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [17],'bavail' => [6894592],'user_favail' => [21367],'caption' => 'After copying 4 files, 16777216 bytes per file','su_bavail' => [11255808],'fper' => [0],'su_favail' => [21367],'per' => [91],'favail' => [21367],'fused' => [17],'su_blocks' => [84467712],'ffree' => [21367],'user_blocks' => [80106496],'used' => [73211904],'su_files' => [21384],'user_bavail' => [6894592],'user_used' => [73211904]},'aremove_1000_12288' => {'bfree' => [78630912],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [13],'bavail' => [74269696],'user_favail' => [21371],'caption' => 'After removing 1000 files, 12288 bytes per file','su_bavail' => [78630912],'fper' => [0],'su_favail' => [21371],'per' => [7],'favail' => [21371],'fused' => [13],'su_blocks' => [84467712],'ffree' => [21371],'user_blocks' => [80106496],'used' => [5836800],'su_files' => [21384],'user_bavail' => [74269696],'user_used' => [5836800]},'amkdir' => {'bfree' => [78665728],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [13],'bavail' => [74304512],'user_favail' => [21371],'caption' => 'After makin directoryes on ext3','su_bavail' => [78665728],'fper' => [0],'su_favail' => [21371],'per' => [7],'favail' => [21371],'fused' => [13],'su_blocks' => [84467712],'ffree' => [21371],'user_blocks' => [80106496],'used' => [5801984],'su_files' => [21384],'user_bavail' => [74304512],'user_used' => [5801984]},'acopy_1000_12288' => {'bfree' => [66360320],'user_files' => [21384],'blocks' => [84467712],'files' => [21384],'user_fused' => [1013],'bavail' => [61999104],'user_favail' => [20371],'caption' => 'After copying 1000 files, 12288 bytes per file','su_bavail' => [66360320],'fper' => [5],'su_favail' => [20371],'per' => [23],'favail' => [20371],'fused' => [1013],'su_blocks' => [84467712],'ffree' => [20371],'user_blocks' => [80106496],'used' => [18107392],'su_files' => [21384],'user_bavail' => [61999104],'user_used' => [18107392]}}}},'average' => {'time' => {'tmpfs' => {'copy_4_16777216' => {'count' => 2,'summ' => '0.34047'},'remove_1000_12288' => {'count' => 2,'summ' => '0.059995'},'copy_1_67108864' => {'count' => 2,'summ' => '0.331434'},'move_1_67108864' => {'count' => 2,'summ' => '0.035942'},'remove_4_16777216' => {'count' => 2,'summ' => '0.036379'},'move_4_16777216' => {'count' => 2,'summ' => '0.025252'},'remove_64_1048576' => {'count' => 2,'summ' => '0.038476'},'move_64_1048576' => {'count' => 2,'summ' => '0.038789'},'remove_8_8388608' => {'count' => 2,'summ' => '0.037664'},'mount' => {'count' => 2,'summ' => '0.027479'},'copy_1000_12288' => {'count' => 2,'summ' => '0.174202'},'umount' => {'count' => 2,'summ' => '0.026655'},'format' => {'count' => 2,'summ' => '0.031778'},'copy_64_1048576' => {'count' => 2,'summ' => '0.347961'},'remove_1_67108864' => {'count' => 2,'summ' => '0.03556'},'move_1000_12288' => {'count' => 2,'summ' => '0.073901'},'mkdir' => {'count' => 4,'summ' => '0.066107'},'move_8_8388608' => {'count' => 2,'summ' => '0.026081'},'copy_8_8388608' => {'count' => 2,'summ' => '0.340712'}},'ext3' => {'copy_4_16777216' => {'count' => 2,'summ' => '1.929225'},'remove_1000_12288' => {'count' => 2,'summ' => '0.121414'},'copy_1_67108864' => {'count' => 2,'summ' => '1.803696'},'move_1_67108864' => {'count' => 2,'summ' => '0.015577'},'remove_4_16777216' => {'count' => 2,'summ' => '0.163609'},'move_4_16777216' => {'count' => 2,'summ' => '0.026148'},'remove_64_1048576' => {'count' => 2,'summ' => '0.140097'},'move_64_1048576' => {'count' => 2,'summ' => '0.042992'},'remove_8_8388608' => {'count' => 2,'summ' => '0.135003'},'mount' => {'count' => 2,'summ' => '0.046362'},'copy_1000_12288' => {'count' => 2,'summ' => '0.491495'},'umount' => {'count' => 2,'summ' => '0.038635'},'format' => {'count' => 2,'summ' => '0.091585'},'copy_64_1048576' => {'count' => 2,'summ' => '1.830827'},'remove_1_67108864' => {'count' => 2,'summ' => '0.141743'},'move_1000_12288' => {'count' => 2,'summ' => '0.169883'},'mkdir' => {'count' => 4,'summ' => '0.087873'},'move_8_8388608' => {'count' => 2,'summ' => '0.047968'},'copy_8_8388608' => {'count' => 2,'summ' => '2.009648'}}},'size' => {'tmpfs' => {'aremove_8_8388608' => {'bfree' => {'count' => 2,'summ' => 2109988864},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 6},'bavail' => {'count' => 2,'summ' => 2109988864},'user_favail' => {'count' => 2,'summ' => 515128},'su_bavail' => {'count' => 2,'summ' => 2109988864},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515128},'per' => {'count' => 2,'summ' => 0},'favail' => {'count' => 2,'summ' => 515128},'fused' => {'count' => 2,'summ' => 6},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 0},'ffree' => {'count' => 2,'summ' => 515128},'used' => {'count' => 2,'summ' => 0},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 2109988864},'user_used' => {'count' => 2,'summ' => 0}},'aremove_1_67108864' => {'bfree' => {'count' => 2,'summ' => 2109988864},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 6},'bavail' => {'count' => 2,'summ' => 2109988864},'user_favail' => {'count' => 2,'summ' => 515128},'su_bavail' => {'count' => 2,'summ' => 2109988864},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515128},'per' => {'count' => 2,'summ' => 0},'favail' => {'count' => 2,'summ' => 515128},'fused' => {'count' => 2,'summ' => 6},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 0},'ffree' => {'count' => 2,'summ' => 515128},'used' => {'count' => 2,'summ' => 0},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 2109988864},'user_used' => {'count' => 2,'summ' => 0}},'aformat' => {'bfree' => {'count' => 2,'summ' => 2109988864},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 2},'bavail' => {'count' => 2,'summ' => 2109988864},'user_favail' => {'count' => 2,'summ' => 515132},'su_bavail' => {'count' => 2,'summ' => 2109988864},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515132},'per' => {'count' => 2,'summ' => 0},'favail' => {'count' => 2,'summ' => 515132},'fused' => {'count' => 2,'summ' => 2},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 0},'ffree' => {'count' => 2,'summ' => 515132},'used' => {'count' => 2,'summ' => 0},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 2109988864},'user_used' => {'count' => 2,'summ' => 0}},'amove_4_16777216' => {'bfree' => {'count' => 2,'summ' => 1975476224},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 14},'bavail' => {'count' => 2,'summ' => 1975476224},'user_favail' => {'count' => 2,'summ' => 515120},'su_bavail' => {'count' => 2,'summ' => 1975476224},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515120},'per' => {'count' => 2,'summ' => 12},'favail' => {'count' => 2,'summ' => 515120},'fused' => {'count' => 2,'summ' => 14},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 2109988864},'ffree' => {'count' => 2,'summ' => 515120},'used' => {'count' => 2,'summ' => 134512640},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 1975476224},'user_used' => {'count' => 2,'summ' => 134512640}},'amove_1_67108864' => {'bfree' => {'count' => 2,'summ' => 1975500800},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 8},'bavail' => {'count' => 2,'summ' => 1975500800},'user_favail' => {'count' => 2,'summ' => 515126},'su_bavail' => {'count' => 2,'summ' => 1975500800},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515126},'per' => {'count' => 2,'summ' => 12},'favail' => {'count' => 2,'summ' => 515126},'fused' => {'count' => 2,'summ' => 8},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 2109988864},'ffree' => {'count' => 2,'summ' => 515126},'used' => {'count' => 2,'summ' => 134488064},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 1975500800},'user_used' => {'count' => 2,'summ' => 134488064}},'amove_8_8388608' => {'bfree' => {'count' => 2,'summ' => 1975443456},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 22},'bavail' => {'count' => 2,'summ' => 1975443456},'user_favail' => {'count' => 2,'summ' => 515112},'su_bavail' => {'count' => 2,'summ' => 1975443456},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515112},'per' => {'count' => 2,'summ' => 12},'favail' => {'count' => 2,'summ' => 515112},'fused' => {'count' => 2,'summ' => 22},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 2109988864},'ffree' => {'count' => 2,'summ' => 515112},'used' => {'count' => 2,'summ' => 134545408},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 1975443456},'user_used' => {'count' => 2,'summ' => 134545408}},'acopy_8_8388608' => {'bfree' => {'count' => 2,'summ' => 1975443456},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 22},'bavail' => {'count' => 2,'summ' => 1975443456},'user_favail' => {'count' => 2,'summ' => 515112},'su_bavail' => {'count' => 2,'summ' => 1975443456},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515112},'per' => {'count' => 2,'summ' => 12},'favail' => {'count' => 2,'summ' => 515112},'fused' => {'count' => 2,'summ' => 22},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 2109988864},'ffree' => {'count' => 2,'summ' => 515112},'used' => {'count' => 2,'summ' => 134545408},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 1975443456},'user_used' => {'count' => 2,'summ' => 134545408}},'aremove_4_16777216' => {'bfree' => {'count' => 2,'summ' => 2109988864},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 6},'bavail' => {'count' => 2,'summ' => 2109988864},'user_favail' => {'count' => 2,'summ' => 515128},'su_bavail' => {'count' => 2,'summ' => 2109988864},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515128},'per' => {'count' => 2,'summ' => 0},'favail' => {'count' => 2,'summ' => 515128},'fused' => {'count' => 2,'summ' => 6},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 0},'ffree' => {'count' => 2,'summ' => 515128},'used' => {'count' => 2,'summ' => 0},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 2109988864},'user_used' => {'count' => 2,'summ' => 0}},'acopy_1_67108864' => {'bfree' => {'count' => 2,'summ' => 1975500800},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 8},'bavail' => {'count' => 2,'summ' => 1975500800},'user_favail' => {'count' => 2,'summ' => 515126},'su_bavail' => {'count' => 2,'summ' => 1975500800},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515126},'per' => {'count' => 2,'summ' => 12},'favail' => {'count' => 2,'summ' => 515126},'fused' => {'count' => 2,'summ' => 8},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 2109988864},'ffree' => {'count' => 2,'summ' => 515126},'used' => {'count' => 2,'summ' => 134488064},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 1975500800},'user_used' => {'count' => 2,'summ' => 134488064}},'aremove_64_1048576' => {'bfree' => {'count' => 2,'summ' => 2109988864},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 6},'bavail' => {'count' => 2,'summ' => 2109988864},'user_favail' => {'count' => 2,'summ' => 515128},'su_bavail' => {'count' => 2,'summ' => 2109988864},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515128},'per' => {'count' => 2,'summ' => 0},'favail' => {'count' => 2,'summ' => 515128},'fused' => {'count' => 2,'summ' => 6},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 0},'ffree' => {'count' => 2,'summ' => 515128},'used' => {'count' => 2,'summ' => 0},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 2109988864},'user_used' => {'count' => 2,'summ' => 0}},'acopy_64_1048576' => {'bfree' => {'count' => 2,'summ' => 1974722560},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 134},'bavail' => {'count' => 2,'summ' => 1974722560},'user_favail' => {'count' => 2,'summ' => 515000},'su_bavail' => {'count' => 2,'summ' => 1974722560},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515000},'per' => {'count' => 2,'summ' => 12},'favail' => {'count' => 2,'summ' => 515000},'fused' => {'count' => 2,'summ' => 134},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 2109988864},'ffree' => {'count' => 2,'summ' => 515000},'used' => {'count' => 2,'summ' => 135266304},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 1974722560},'user_used' => {'count' => 2,'summ' => 135266304}},'amove_64_1048576' => {'bfree' => {'count' => 2,'summ' => 1974722560},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 134},'bavail' => {'count' => 2,'summ' => 1974722560},'user_favail' => {'count' => 2,'summ' => 515000},'su_bavail' => {'count' => 2,'summ' => 1974722560},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515000},'per' => {'count' => 2,'summ' => 12},'favail' => {'count' => 2,'summ' => 515000},'fused' => {'count' => 2,'summ' => 134},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 2109988864},'ffree' => {'count' => 2,'summ' => 515000},'used' => {'count' => 2,'summ' => 135266304},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 1974722560},'user_used' => {'count' => 2,'summ' => 135266304}},'amove_1000_12288' => {'bfree' => {'count' => 2,'summ' => 2085412864},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 2006},'bavail' => {'count' => 2,'summ' => 2085412864},'user_favail' => {'count' => 2,'summ' => 513128},'su_bavail' => {'count' => 2,'summ' => 2085412864},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 513128},'per' => {'count' => 2,'summ' => 2},'favail' => {'count' => 2,'summ' => 513128},'fused' => {'count' => 2,'summ' => 2006},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 2109988864},'ffree' => {'count' => 2,'summ' => 513128},'used' => {'count' => 2,'summ' => 24576000},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 2085412864},'user_used' => {'count' => 2,'summ' => 24576000}},'acopy_4_16777216' => {'bfree' => {'count' => 2,'summ' => 1975476224},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 14},'bavail' => {'count' => 2,'summ' => 1975476224},'user_favail' => {'count' => 2,'summ' => 515120},'su_bavail' => {'count' => 2,'summ' => 1975476224},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515120},'per' => {'count' => 2,'summ' => 12},'favail' => {'count' => 2,'summ' => 515120},'fused' => {'count' => 2,'summ' => 14},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 2109988864},'ffree' => {'count' => 2,'summ' => 515120},'used' => {'count' => 2,'summ' => 134512640},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 1975476224},'user_used' => {'count' => 2,'summ' => 134512640}},'aremove_1000_12288' => {'bfree' => {'count' => 2,'summ' => 2109988864},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 6},'bavail' => {'count' => 2,'summ' => 2109988864},'user_favail' => {'count' => 2,'summ' => 515128},'su_bavail' => {'count' => 2,'summ' => 2109988864},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515128},'per' => {'count' => 2,'summ' => 0},'favail' => {'count' => 2,'summ' => 515128},'fused' => {'count' => 2,'summ' => 6},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 0},'ffree' => {'count' => 2,'summ' => 515128},'used' => {'count' => 2,'summ' => 0},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 2109988864},'user_used' => {'count' => 2,'summ' => 0}},'amkdir' => {'bfree' => {'count' => 2,'summ' => 2109988864},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 6},'bavail' => {'count' => 2,'summ' => 2109988864},'user_favail' => {'count' => 2,'summ' => 515128},'su_bavail' => {'count' => 2,'summ' => 2109988864},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 515128},'per' => {'count' => 2,'summ' => 0},'favail' => {'count' => 2,'summ' => 515128},'fused' => {'count' => 2,'summ' => 6},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 0},'ffree' => {'count' => 2,'summ' => 515128},'used' => {'count' => 2,'summ' => 0},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 2109988864},'user_used' => {'count' => 2,'summ' => 0}},'acopy_1000_12288' => {'bfree' => {'count' => 2,'summ' => 2085412864},'user_files' => {'count' => 2,'summ' => 515134},'blocks' => {'count' => 2,'summ' => 2109988864},'files' => {'count' => 2,'summ' => 515134},'user_fused' => {'count' => 2,'summ' => 2006},'bavail' => {'count' => 2,'summ' => 2085412864},'user_favail' => {'count' => 2,'summ' => 513128},'su_bavail' => {'count' => 2,'summ' => 2085412864},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 513128},'per' => {'count' => 2,'summ' => 2},'favail' => {'count' => 2,'summ' => 513128},'fused' => {'count' => 2,'summ' => 2006},'su_blocks' => {'count' => 2,'summ' => 2109988864},'user_blocks' => {'count' => 2,'summ' => 2109988864},'ffree' => {'count' => 2,'summ' => 513128},'used' => {'count' => 2,'summ' => 24576000},'su_files' => {'count' => 2,'summ' => 515134},'user_bavail' => {'count' => 2,'summ' => 2085412864},'user_used' => {'count' => 2,'summ' => 24576000}}},'ext3' => {'aremove_8_8388608' => {'bfree' => {'count' => 2,'summ' => 157261824},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 26},'bavail' => {'count' => 2,'summ' => 148539392},'user_favail' => {'count' => 2,'summ' => 42742},'su_bavail' => {'count' => 2,'summ' => 157261824},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42742},'per' => {'count' => 2,'summ' => 14},'favail' => {'count' => 2,'summ' => 42742},'fused' => {'count' => 2,'summ' => 26},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42742},'used' => {'count' => 2,'summ' => 11673600},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 148539392},'user_used' => {'count' => 2,'summ' => 11673600}},'aremove_1_67108864' => {'bfree' => {'count' => 2,'summ' => 157261824},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 26},'bavail' => {'count' => 2,'summ' => 148539392},'user_favail' => {'count' => 2,'summ' => 42742},'su_bavail' => {'count' => 2,'summ' => 157261824},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42742},'per' => {'count' => 2,'summ' => 14},'favail' => {'count' => 2,'summ' => 42742},'fused' => {'count' => 2,'summ' => 26},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42742},'used' => {'count' => 2,'summ' => 11673600},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 148539392},'user_used' => {'count' => 2,'summ' => 11673600}},'aformat' => {'bfree' => {'count' => 2,'summ' => 157335552},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 22},'bavail' => {'count' => 2,'summ' => 148613120},'user_favail' => {'count' => 2,'summ' => 42746},'su_bavail' => {'count' => 2,'summ' => 157335552},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42746},'per' => {'count' => 2,'summ' => 14},'favail' => {'count' => 2,'summ' => 42746},'fused' => {'count' => 2,'summ' => 22},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42746},'used' => {'count' => 2,'summ' => 11599872},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 148613120},'user_used' => {'count' => 2,'summ' => 11599872}},'amove_4_16777216' => {'bfree' => {'count' => 2,'summ' => 22511616},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 34},'bavail' => {'count' => 2,'summ' => 13789184},'user_favail' => {'count' => 2,'summ' => 42734},'su_bavail' => {'count' => 2,'summ' => 22511616},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42734},'per' => {'count' => 2,'summ' => 182},'favail' => {'count' => 2,'summ' => 42734},'fused' => {'count' => 2,'summ' => 34},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42734},'used' => {'count' => 2,'summ' => 146423808},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 13789184},'user_used' => {'count' => 2,'summ' => 146423808}},'amove_1_67108864' => {'bfree' => {'count' => 2,'summ' => 22517760},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 28},'bavail' => {'count' => 2,'summ' => 13795328},'user_favail' => {'count' => 2,'summ' => 42740},'su_bavail' => {'count' => 2,'summ' => 22517760},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42740},'per' => {'count' => 2,'summ' => 182},'favail' => {'count' => 2,'summ' => 42740},'fused' => {'count' => 2,'summ' => 28},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42740},'used' => {'count' => 2,'summ' => 146417664},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 13795328},'user_used' => {'count' => 2,'summ' => 146417664}},'amove_8_8388608' => {'bfree' => {'count' => 2,'summ' => 22503424},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 42},'bavail' => {'count' => 2,'summ' => 13780992},'user_favail' => {'count' => 2,'summ' => 42726},'su_bavail' => {'count' => 2,'summ' => 22503424},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42726},'per' => {'count' => 2,'summ' => 182},'favail' => {'count' => 2,'summ' => 42726},'fused' => {'count' => 2,'summ' => 42},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42726},'used' => {'count' => 2,'summ' => 146432000},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 13780992},'user_used' => {'count' => 2,'summ' => 146432000}},'acopy_8_8388608' => {'bfree' => {'count' => 2,'summ' => 22503424},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 42},'bavail' => {'count' => 2,'summ' => 13780992},'user_favail' => {'count' => 2,'summ' => 42726},'su_bavail' => {'count' => 2,'summ' => 22503424},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42726},'per' => {'count' => 2,'summ' => 182},'favail' => {'count' => 2,'summ' => 42726},'fused' => {'count' => 2,'summ' => 42},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42726},'used' => {'count' => 2,'summ' => 146432000},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 13780992},'user_used' => {'count' => 2,'summ' => 146432000}},'aremove_4_16777216' => {'bfree' => {'count' => 2,'summ' => 157261824},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 26},'bavail' => {'count' => 2,'summ' => 148539392},'user_favail' => {'count' => 2,'summ' => 42742},'su_bavail' => {'count' => 2,'summ' => 157261824},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42742},'per' => {'count' => 2,'summ' => 14},'favail' => {'count' => 2,'summ' => 42742},'fused' => {'count' => 2,'summ' => 26},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42742},'used' => {'count' => 2,'summ' => 11673600},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 148539392},'user_used' => {'count' => 2,'summ' => 11673600}},'acopy_1_67108864' => {'bfree' => {'count' => 2,'summ' => 22517760},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 28},'bavail' => {'count' => 2,'summ' => 13795328},'user_favail' => {'count' => 2,'summ' => 42740},'su_bavail' => {'count' => 2,'summ' => 22517760},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42740},'per' => {'count' => 2,'summ' => 182},'favail' => {'count' => 2,'summ' => 42740},'fused' => {'count' => 2,'summ' => 28},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42740},'used' => {'count' => 2,'summ' => 146417664},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 13795328},'user_used' => {'count' => 2,'summ' => 146417664}},'aremove_64_1048576' => {'bfree' => {'count' => 2,'summ' => 157331456},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 26},'bavail' => {'count' => 2,'summ' => 148609024},'user_favail' => {'count' => 2,'summ' => 42742},'su_bavail' => {'count' => 2,'summ' => 157331456},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42742},'per' => {'count' => 2,'summ' => 14},'favail' => {'count' => 2,'summ' => 42742},'fused' => {'count' => 2,'summ' => 26},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42742},'used' => {'count' => 2,'summ' => 11603968},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 148609024},'user_used' => {'count' => 2,'summ' => 11603968}},'acopy_64_1048576' => {'bfree' => {'count' => 2,'summ' => 22458368},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 154},'bavail' => {'count' => 2,'summ' => 13735936},'user_favail' => {'count' => 2,'summ' => 42614},'su_bavail' => {'count' => 2,'summ' => 22458368},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42614},'per' => {'count' => 2,'summ' => 182},'favail' => {'count' => 2,'summ' => 42614},'fused' => {'count' => 2,'summ' => 154},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42614},'used' => {'count' => 2,'summ' => 146477056},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 13735936},'user_used' => {'count' => 2,'summ' => 146477056}},'amove_64_1048576' => {'bfree' => {'count' => 2,'summ' => 22458368},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 154},'bavail' => {'count' => 2,'summ' => 13735936},'user_favail' => {'count' => 2,'summ' => 42614},'su_bavail' => {'count' => 2,'summ' => 22458368},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42614},'per' => {'count' => 2,'summ' => 182},'favail' => {'count' => 2,'summ' => 42614},'fused' => {'count' => 2,'summ' => 154},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42614},'used' => {'count' => 2,'summ' => 146477056},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 13735936},'user_used' => {'count' => 2,'summ' => 146477056}},'amove_1000_12288' => {'bfree' => {'count' => 2,'summ' => 132685824},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 2026},'bavail' => {'count' => 2,'summ' => 123963392},'user_favail' => {'count' => 2,'summ' => 40742},'su_bavail' => {'count' => 2,'summ' => 132685824},'fper' => {'count' => 2,'summ' => 10},'su_favail' => {'count' => 2,'summ' => 40742},'per' => {'count' => 2,'summ' => 46},'favail' => {'count' => 2,'summ' => 40742},'fused' => {'count' => 2,'summ' => 2026},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 40742},'used' => {'count' => 2,'summ' => 36249600},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 123963392},'user_used' => {'count' => 2,'summ' => 36249600}},'acopy_4_16777216' => {'bfree' => {'count' => 2,'summ' => 22511616},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 34},'bavail' => {'count' => 2,'summ' => 13789184},'user_favail' => {'count' => 2,'summ' => 42734},'su_bavail' => {'count' => 2,'summ' => 22511616},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42734},'per' => {'count' => 2,'summ' => 182},'favail' => {'count' => 2,'summ' => 42734},'fused' => {'count' => 2,'summ' => 34},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42734},'used' => {'count' => 2,'summ' => 146423808},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 13789184},'user_used' => {'count' => 2,'summ' => 146423808}},'aremove_1000_12288' => {'bfree' => {'count' => 2,'summ' => 157261824},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 26},'bavail' => {'count' => 2,'summ' => 148539392},'user_favail' => {'count' => 2,'summ' => 42742},'su_bavail' => {'count' => 2,'summ' => 157261824},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42742},'per' => {'count' => 2,'summ' => 14},'favail' => {'count' => 2,'summ' => 42742},'fused' => {'count' => 2,'summ' => 26},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42742},'used' => {'count' => 2,'summ' => 11673600},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 148539392},'user_used' => {'count' => 2,'summ' => 11673600}},'amkdir' => {'bfree' => {'count' => 2,'summ' => 157331456},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 26},'bavail' => {'count' => 2,'summ' => 148609024},'user_favail' => {'count' => 2,'summ' => 42742},'su_bavail' => {'count' => 2,'summ' => 157331456},'fper' => {'count' => 2,'summ' => 0},'su_favail' => {'count' => 2,'summ' => 42742},'per' => {'count' => 2,'summ' => 14},'favail' => {'count' => 2,'summ' => 42742},'fused' => {'count' => 2,'summ' => 26},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 42742},'used' => {'count' => 2,'summ' => 11603968},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 148609024},'user_used' => {'count' => 2,'summ' => 11603968}},'acopy_1000_12288' => {'bfree' => {'count' => 2,'summ' => 132720640},'user_files' => {'count' => 2,'summ' => 42768},'blocks' => {'count' => 2,'summ' => 168935424},'files' => {'count' => 2,'summ' => 42768},'user_fused' => {'count' => 2,'summ' => 2026},'bavail' => {'count' => 2,'summ' => 123998208},'user_favail' => {'count' => 2,'summ' => 40742},'su_bavail' => {'count' => 2,'summ' => 132720640},'fper' => {'count' => 2,'summ' => 10},'su_favail' => {'count' => 2,'summ' => 40742},'per' => {'count' => 2,'summ' => 46},'favail' => {'count' => 2,'summ' => 40742},'fused' => {'count' => 2,'summ' => 2026},'su_blocks' => {'count' => 2,'summ' => 168935424},'user_blocks' => {'count' => 2,'summ' => 160212992},'ffree' => {'count' => 2,'summ' => 40742},'used' => {'count' => 2,'summ' => 36214784},'su_files' => {'count' => 2,'summ' => 42768},'user_bavail' => {'count' => 2,'summ' => 123998208},'user_used' => {'count' => 2,'summ' => 36214784}}}}}};
+#print_result();
+__END__
+
+
