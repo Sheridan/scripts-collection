@@ -1,0 +1,41 @@
+#!/bin/bash
+
+distfiles_dir="/usr/portage/distfiles"
+target_dir="/media/Sheridan/_/portage"
+
+function pack_tree()
+{
+  tree_name=$1
+  tree_dir=$2
+  rm -f /tmp/pp
+  for l in `ls -1 $tree_dir | egrep -v "distfiles|packages"`
+  do
+	echo $tree_dir/$l >> /tmp/pp
+  done
+  echo "Packing tree '$tree_name' ($tree_dir)"
+  tar -cjv --file=$target_dir/$tree_name.tar.bz2 --files-from=/tmp/pp
+  rm /tmp/pp
+}
+
+function copy_distfiles()
+{
+  mkdir -p $target_dir/distfiles
+  for f in $distfiles_dir/*
+  do
+	if [ ! -d $f ]
+	then
+	  echo "Copying $f..."
+	  cp -u $f $target_dir/distfiles/
+	fi
+  done
+}
+
+mkdir -p $target_dir
+
+emerge --info
+pack_tree "portage" "/usr/portage"
+#pack_tree "arcon" "/home/sheridan/data/development/gentoo/arcon/arcon/trunk/arcon-overlay"
+#pack_tree "devnull" "/usr/local/portage/layman/devnull"
+#pack_tree "sunrise" "/usr/local/portage/layman/sunrise"
+#pack_tree "games" "/usr/local/portage/layman/games"
+copy_distfiles
