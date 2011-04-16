@@ -1,0 +1,44 @@
+#!/bin/bash
+
+grwzn0="dot"
+grwzn1="neato"
+grwzn2="circo"
+grwzn3="fdp"
+grwzn4="twopi"
+
+grwz0="${grwzn0}"
+grwz1="${grwzn1} -Goverlap=false"
+grwz2="${grwzn2}"
+grwz3="${grwzn3}"
+grwz4="${grwzn4} -Goverlap=false"
+
+
+for file in `ls *dot`
+do
+    name=`basename ${file} .dot`
+    gc -ar ${file}
+    rm -rf ${name}
+    mkdir -p ${name}
+    for num in 1 3 4 #0 1 3 4 2
+    do
+	grwz="grwz${num}"
+	grwzn="grwzn${num}"
+	echo -n "Making ${!grwzn} for ${name}"
+	ifline=""
+	for iformat in svg #png #svg jpeg
+	do
+	    mkdir -p "${name}/${iformat}"
+	    img="${name}/${iformat}/${name}_${!grwzn}.${iformat}"
+	    echo -n " ${iformat}"
+	    ifline="${ifline} -T${iformat} -o ${img}"
+	    #${!grwz} -T${iformat} ${file} -o ${img_f}
+	done
+	echo
+	${!grwz} ${ifline} ${file}
+    done
+    rm ${name}.rar
+    rar a ${name}.rar ${name}/*
+#    cp -vf ${name}.rar /mnt/network/ftp/upfr/main/raions/030/graphs/
+done
+
+

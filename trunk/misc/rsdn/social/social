@@ -1,0 +1,196 @@
+#!/usr/bin/perl -w
+
+use strict;
+use DBI;
+use Data::Dumper;
+
+my $data_file = "avalon.data";
+my $minimum_messages = 500;
+my $minimum_talks = 30;
+my $db_login = '';
+my $db_passw = '';
+my $dbh = DBI->connect("DBI:mysql:avalon:gate", $db_login, $db_passw);
+
+
+my $users;
+
+sub load_from_db
+{
+  print("Loading users...\n");
+  my $q = $dbh->prepare
+  (qq{
+    select message.id_user, count(message.id) as cnt
+    from message
+    group by message.id_user
+    having count(message.id)>$minimum_messages
+  });
+  $q->execute();
+  while (my ($uid, $user_messages) = $q->fetchrow_array())
+  {
+    printf("[u:%s,m:%s]", $uid, $user_messages);
+    $users->{'data'}{$uid}{'messages'} = $user_messages;
+  }
+  $q->finish();
+  print "\n";
+  $users->{'list'} = join(',', sort keys %{$users->{'data'}});
+  for my $uid (sort keys %{$users->{'data'}})
+  {
+    mine_user($uid);
+  }
+  my $handle;
+  open ($handle, '>', $data_file);
+  print { $handle } (Dumper ($users)); 
+  close ($handle)
+}
+
+sub select_row
+{
+  my $text = $_[0];
+  my $q = $dbh->prepare($text);
+  $q->execute();
+  my @result = $q->fetchrow_array();
+  $q->finish();
+  return [@result];
+}
+
+sub mine_user
+{
+  my $uid = $_[0];
+  printf("Loading user %s...\n", $uid);
+  (
+    $users->{'data'}{$uid}{'name'},
+    $users->{'data'}{$uid}{'nick'}
+  ) = @{select_row
+  (qq{
+    select name, nick
+    from user
+    where id=$uid
+  })};  
+  
+  printf("Loading user %s relations...\n", $uid);
+  my $q = $dbh->prepare
+  (sprintf(qq{
+    select message.id_user, count(message.id) as cnt
+    from message
+    where 
+     message.id_parent in
+     (
+       select min.id from message min where min.id_user=%s
+     )
+    and
+    message.id_user in (%s)
+    group by message.id_user
+  }, $uid, $users->{'list'}));
+  $q->execute();
+  while (my ($to_uid, $cnt) = $q->fetchrow_array())
+  {
+    printf("[u:%s,m:%s]", $to_uid, $cnt);
+    $users->{'data'}{$uid}{'to'}{$to_uid} = $cnt;
+  }
+  $q->finish();
+  print "\n";
+}
+
+sub load_file
+{
+  my $handle;
+  return 0 unless open ($handle, '<', $data_file);
+  my ($VAR1, $ddata) = ('','');
+  for my $line (<$handle>)
+  { 
+    $ddata .= $line; 
+  } 
+  eval $ddata;
+  $users = $VAR1;
+  close ($handle);
+  return 1;
+}
+
+sub construct_dot
+{
+  my $handle;
+  printf("Users count %s\n", scalar (keys (%{$users->{'data'}})));
+  open ($handle, '>', "graph.dot");
+  print { $handle } <<_;
+digraph G 
+{ 
+  graph[
+    splines="true", 
+    overlap="false",
+    fontsize=10,
+    smoothing="spring",
+    concentrate="true",
+    K=1];
+  edge [dir=both,arrowhead=dot,arrowtail=dot];
+  node [shape="octagon"];
+_
+   
+  #print { $handle } ($g->as_plain);
+  for my $uid (sort { $a <=> $b } keys %{$users->{'data'}})
+  {
+    print { $handle }  sprintf(
+      qq{ user_%s [label=<%s (%s)<br />%s>]; \n}, 
+      $uid, 
+      $users->{'data'}{$uid}{'name'}, 
+      $users->{'data'}{$uid}{'nick'}, 
+      $users->{'data'}{$uid}{'messages'});
+  }
+  my $exn = {};
+  my $colors = assign_weight_colors();
+  for my $uid (sort { $a <=> $b } keys %{$users->{'data'}})
+  {
+    for my $companion (sort { $a <=> $b } keys %{$users->{'data'}})
+    {
+      #next if($uid == $companion);
+      next if(exists($exn->{$uid}{$companion}) or exists($exn->{$companion}{$uid}) or $companion == $uid);
+      my ($to, $from) = (
+                         exists($users->{'data'}{$uid}{'to'}{$companion}) ? $users->{'data'}{$uid}{'to'}{$companion} : 0,
+                         exists($users->{'data'}{$companion}{'to'}{$uid}) ? $users->{'data'}{$companion}{'to'}{$uid} : 0
+                        );
+      my $weight = $to + $from;
+      next if ($weight < $minimum_talks);
+      print { $handle }  sprintf
+      (
+        qq{ user_%s -> user_%s [weight="%s", color="#%s44"]; \n}, 
+        $uid, 
+        $companion, 
+        $weight,
+        $colors->{$weight}
+      );
+      $exn->{$uid}{$companion} = 1;
+    }
+  }
+  print { $handle } '}';
+  close ($handle);
+}
+
+sub assign_weight_colors
+{
+  my $colors = {};
+  my $count = 0;
+  for my $uid (sort { $a <=> $b } keys %{$users->{'data'}})
+  {
+    for my $companion (sort { $a <=> $b } keys %{$users->{'data'}})
+    {
+      my ($to, $from) = (
+                         exists($users->{'data'}{$uid}{'to'}{$companion}) ? $users->{'data'}{$uid}{'to'}{$companion} : 0,
+                         exists($users->{'data'}{$companion}{'to'}{$uid}) ? $users->{'data'}{$companion}{'to'}{$uid} : 0
+                        );
+      my $weight = $to + $from;
+      next if ($weight < $minimum_talks);
+      $count++ unless exists( $colors->{$weight});
+      $colors->{$weight} = 1;
+    }
+  }
+  my @gradient=split(/:/,`get_gradient -s=00FF00 -e=FF0000 -t=rcw -S=$count -l`);
+  my $i = 0;
+  for my $weight (sort keys %{$colors})
+  {
+    $colors->{$weight} = $gradient[$i];
+    $i++;
+  }
+  return $colors;
+}
+
+load_from_db() unless (load_file());
+construct_dot();
