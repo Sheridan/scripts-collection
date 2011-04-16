@@ -1,0 +1,4 @@
+#!/bin/bash
+
+du -h --max-depth=1
+echo "Total files: $(find -type f | wc -l)"

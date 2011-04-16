@@ -1,0 +1,72 @@
+#!/bin/bash
+
+. /etc/colors
+
+function help() {
+    echo '
+    -h This
+    -s Status of all services
+    -l Services list
+    service_name command - Do command with service service_name
+    Usage:
+    service ([h|s|l]|service_name [command])
+    
+'
+    exit 0
+}
+
+function service_proc() {
+    local service=$1
+    local command=$2
+    start=`date +%s`
+    echo "[${c_h_green}Service ${c_yellow}${service}${c_h_green}, command ${c_yellow}${command}${c_std}]"
+    /etc/init.d/${service} --verbose ${command}
+    status=$?
+    echo "[${c_h_green}Done. ${c_h_pink}$((`date +%s` - $start))${c_h_cayan} sec.${c_std}]"
+    exit $status
+}
+
+function services_statuses() {
+    echo "[${c_h_green}Services statuses${c_std}]"
+    rc-status -a
+    exit 0
+
+}
+
+function services_list() {
+    echo "[${c_h_green}Services list${c_std}]"
+    ls -1 /etc/init.d/
+    exit $?
+}
+
+#parce cmdline
+services=""
+command=""
+while [ $# -gt 0 ]
+do
+    case "$1" in
+    -h )
+	help
+	exit 0
+    ;;
+    -s )
+	services_statuses
+	exit 0
+    ;;
+    -l )
+	services_list
+	exit 0
+    ;;
+    `ls -1 /etc/init.d/ | grep -x "$1"` )
+	service=$1
+	shift
+	command=$1
+	service_proc "${service}" "${command}"
+    ;;
+    esac
+    shift
+done
+										
+
+
+
